@@ -1,0 +1,407 @@
+#include "app_state.h"
+#include "config.h"
+#include "mqtt_client.h"
+#include "screen_stream.h"
+
+#include <switch.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define INNER_HEAP_SIZE 0x100000
+#define HEARTBEAT_PATH "sdmc:/switch/switch-ha/sysmodule-heartbeat.txt"
+#define LOG_PATH "sdmc:/switch/switch-ha/sysmodule.log"
+#define OPTIONAL_INIT_TIMEOUT_NS (1500ULL * 1000ULL * 1000ULL)
+#define RESULT_OPTIONAL_TIMEOUT MAKERESULT(Module_Libnx, LibnxError_Timeout)
+#define RESULT_NOT_INITIALIZED MAKERESULT(Module_Libnx, LibnxError_NotInitialized)
+
+static Result g_socket_init_result = RESULT_NOT_INITIALIZED;
+static Result g_psm_init_result = RESULT_NOT_INITIALIZED;
+static Result g_spsm_init_result = RESULT_NOT_INITIALIZED;
+static Result g_hid_init_result = RESULT_NOT_INITIALIZED;
+static Result g_lbl_init_result = RESULT_NOT_INITIALIZED;
+static Result g_audctl_init_result = RESULT_NOT_INITIALIZED;
+static Result g_pminfo_init_result = RESULT_NOT_INITIALIZED;
+static Thread g_power_guard_thread = {0};
+static bool g_power_guard_thread_active = false;
+
+u32 __nx_applet_type = AppletType_None;
+u32 __nx_fs_num_sessions = 1;
+
+void __libnx_initheap(void) {
+    static u8 inner_heap[INNER_HEAP_SIZE];
+    extern void *fake_heap_start;
+    extern void *fake_heap_end;
+
+    fake_heap_start = inner_heap;
+    fake_heap_end = inner_heap + sizeof(inner_heap);
+}
+
+void __appInit(void) {
+    Result rc = smInitialize();
+    if (R_FAILED(rc)) {
+        diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_SM));
+    }
+
+    rc = fsInitialize();
+    if (R_FAILED(rc)) {
+        diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
+    }
+    fsdevMountSdmc();
+
+    smExit();
+}
+
+void __appExit(void) {
+    if (g_power_guard_thread_active) {
+        threadClose(&g_power_guard_thread);
+        g_power_guard_thread_active = false;
+    }
+    if (R_SUCCEEDED(g_pminfo_init_result)) pminfoExit();
+    if (R_SUCCEEDED(g_audctl_init_result)) audctlExit();
+    if (R_SUCCEEDED(g_lbl_init_result)) lblExit();
+    if (R_SUCCEEDED(g_hid_init_result)) hidExit();
+    screen_stream_stop();
+    if (R_SUCCEEDED(g_spsm_init_result)) spsmExit();
+    if (R_SUCCEEDED(g_psm_init_result)) psmExit();
+    if (R_SUCCEEDED(g_socket_init_result)) socketExit();
+    fsdevUnmountAll();
+    fsExit();
+}
+
+static u64 monotonic_ms(void) {
+    return armTicksToNs(armGetSystemTick()) / 1000000ULL;
+}
+
+static void append_log(const char *message) {
+    FILE *file = fopen(LOG_PATH, "a");
+    if (!file) {
+        return;
+    }
+    fprintf(file, "%lu %s\n", monotonic_ms(), message);
+    fclose(file);
+}
+
+static void append_log_result(const char *name, Result rc) {
+    char line[96];
+    snprintf(line, sizeof(line), "%s=0x%x", name, rc);
+    append_log(line);
+}
+
+static void init_core_services(AppState *state) {
+    append_log("core service init start");
+
+    Result rc = smInitialize();
+    if (R_FAILED(rc)) {
+        append_log_result("sm_init", rc);
+        return;
+    }
+
+    SocketInitConfig socket_config = {
+        .tcp_tx_buf_size = 0x8000,
+        .tcp_rx_buf_size = 0x8000,
+        .tcp_tx_buf_max_size = 0,
+        .tcp_rx_buf_max_size = 0,
+        .udp_tx_buf_size = 0x2400,
+        .udp_rx_buf_size = 0xA500,
+        .sb_efficiency = 4,
+        .num_bsd_sessions = 3,
+        .bsd_service_type = BsdServiceType_System,
+    };
+    g_socket_init_result = socketInitialize(&socket_config);
+    append_log_result("socket_init", g_socket_init_result);
+
+    g_psm_init_result = psmInitialize();
+    append_log_result("psm_init", g_psm_init_result);
+
+    g_spsm_init_result = spsmInitialize();
+    state->svc_spsm_ready = R_SUCCEEDED(g_spsm_init_result);
+    append_log_result("spsm_init", g_spsm_init_result);
+
+    smExit();
+    append_log("core service init done");
+}
+
+static void power_guard_thread_main(void* arg) {
+    AppState* state = arg;
+    bool last_sleeping = false;
+    bool last_screen_off = false;
+    bool system_was_active_in_dock = false;
+
+    LblBacklightSwitchStatus backlight;
+    Result rc;
+    bool screen_off;
+    bool is_docked_by_state;
+    bool sleeping;
+
+    while (true) {
+        if (!state->svc_lbl_ready) {
+            svcSleepThread(1000ULL * 1000ULL * 1000ULL);
+            continue;
+        }
+
+        backlight = LblBacklightSwitchStatus_Enabled;
+        rc = lblGetBacklightSwitchStatus(&backlight);
+        if (R_FAILED(rc)) {
+            svcSleepThread(250ULL * 1000ULL * 1000ULL);
+            continue;
+        }
+
+        screen_off = (backlight == LblBacklightSwitchStatus_Disabled ||
+            backlight == LblBacklightSwitchStatus_Disabling);
+
+        if (screen_off != last_screen_off) {
+            screen_stream_set_paused(screen_off);
+            last_screen_off = screen_off;
+        }
+
+        is_docked_by_state = screen_off && !state->power_sleeping;
+        sleeping = screen_off && !is_docked_by_state;
+
+        if (screen_off && is_docked_by_state) {
+            system_was_active_in_dock = true;
+        }
+
+        if (sleeping && system_was_active_in_dock) {
+            mutexLock(&state->lock);
+            state->power_sleeping = true;
+            state->sensor_publish_requested = true;
+            mutexUnlock(&state->lock);
+
+            svcSleepThread(150ULL * 1000ULL * 1000ULL);
+            system_was_active_in_dock = false;
+        }
+
+        if (sleeping != last_sleeping) {
+            mutexLock(&state->lock);
+            state->power_sleeping = sleeping;
+            state->sensor_publish_requested = true;
+            mutexUnlock(&state->lock);
+            last_sleeping = sleeping;
+        }
+
+        svcSleepThread(sleeping ? 2000ULL * 1000ULL * 1000ULL : 1000ULL * 100ULL * 100ULL);
+    }
+}
+
+
+static void init_power_guard(AppState *state) {
+    Result rc = threadCreate(&g_power_guard_thread, power_guard_thread_main, state, NULL, 0x4000, 0x2B, -2);
+    if (R_FAILED(rc)) {
+        append_log_result("power_guard_create", rc);
+        return;
+    }
+    g_power_guard_thread_active = true;
+    rc = threadStart(&g_power_guard_thread);
+    if (R_FAILED(rc)) {
+        append_log_result("power_guard_start", rc);
+        threadClose(&g_power_guard_thread);
+        g_power_guard_thread_active = false;
+    }
+}
+
+static void apply_startup_delay(const AppConfig *config) {
+    if (config->startup_delay_seconds <= 0) {
+        return;
+    }
+
+    char line[96];
+    snprintf(line, sizeof(line), "startup delay %d sec", config->startup_delay_seconds);
+    append_log(line);
+    svcSleepThread((u64) config->startup_delay_seconds * 1000ULL * 1000ULL * 1000ULL);
+    append_log("startup delay done");
+}
+
+typedef enum {
+    OptionalService_Hid,
+    OptionalService_Lbl,
+    OptionalService_Audctl,
+    OptionalService_Pminfo,
+} OptionalService;
+
+typedef struct {
+    OptionalService service;
+    volatile bool done;
+    Result rc;
+} OptionalInitTask;
+
+static void optional_init_thread(void *arg) {
+    OptionalInitTask *task = arg;
+    Result rc = smInitialize();
+    if (R_SUCCEEDED(rc)) {
+        switch (task->service) {
+            case OptionalService_Hid:
+                rc = hidInitialize();
+                break;
+            case OptionalService_Lbl:
+                rc = lblInitialize();
+                break;
+            case OptionalService_Audctl:
+                rc = audctlInitialize();
+                break;
+            case OptionalService_Pminfo:
+                rc = pminfoInitialize();
+                break;
+        }
+        smExit();
+    }
+    task->rc = rc;
+    task->done = true;
+}
+
+static Result init_service_with_timeout(const char *label, OptionalService service) {
+    char line[96];
+    snprintf(line, sizeof(line), "starting %s", label);
+    append_log(line);
+
+    OptionalInitTask *task = calloc(1, sizeof(*task));
+    if (!task) {
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
+    task->service = service;
+    task->rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+
+    Thread *thread = calloc(1, sizeof(*thread));
+    if (!thread) {
+        free(task);
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
+
+    Result rc = threadCreate(thread, optional_init_thread, task, NULL, 0x4000, 0x2B, -2);
+    if (R_FAILED(rc)) {
+        free(thread);
+        free(task);
+        return rc;
+    }
+
+    rc = threadStart(thread);
+    if (R_FAILED(rc)) {
+        threadClose(thread);
+        free(thread);
+        free(task);
+        return rc;
+    }
+
+    rc = waitSingle(waiterForThread(thread), OPTIONAL_INIT_TIMEOUT_NS);
+    if (R_SUCCEEDED(rc) && task->done) {
+        Result init_rc = task->rc;
+        threadWaitForExit(thread);
+        threadClose(thread);
+        free(thread);
+        free(task);
+        return init_rc;
+    }
+
+    snprintf(line, sizeof(line), "%s init timed out", label);
+    append_log(line);
+    return RESULT_OPTIONAL_TIMEOUT;
+}
+
+static void init_optional_services(AppState *state) {
+    append_log("optional service init start");
+
+    g_hid_init_result = init_service_with_timeout("hid", OptionalService_Hid);
+    state->svc_hid_ready = R_SUCCEEDED(g_hid_init_result);
+    append_log_result("hid_init", g_hid_init_result);
+
+    g_lbl_init_result = init_service_with_timeout("lbl", OptionalService_Lbl);
+    state->svc_lbl_ready = R_SUCCEEDED(g_lbl_init_result);
+    append_log_result("lbl_init", g_lbl_init_result);
+
+    g_audctl_init_result = init_service_with_timeout("audctl", OptionalService_Audctl);
+    state->svc_audctl_ready = R_SUCCEEDED(g_audctl_init_result);
+    append_log_result("audctl_init", g_audctl_init_result);
+
+    g_pminfo_init_result = init_service_with_timeout("pminfo", OptionalService_Pminfo);
+    state->svc_pminfo_ready = R_SUCCEEDED(g_pminfo_init_result);
+    append_log_result("pminfo_init", g_pminfo_init_result);
+
+    append_log("optional service init done");
+}
+
+static void write_heartbeat(AppState *state) {
+    FILE *file = fopen(HEARTBEAT_PATH, "w");
+    if (!file) {
+        return;
+    }
+
+    mutexLock(&state->lock);
+    fprintf(file, "build=%s\n", SHA_APP_BUILD);
+    fprintf(file, "uptime_ms=%lu\n", monotonic_ms());
+    fprintf(file, "config=%s\n", state->config_status);
+    fprintf(file, "mqtt_connected=%d\n", state->mqtt_connected ? 1 : 0);
+    fprintf(file, "mqtt_dns_ok=%d\n", state->mqtt_dns_ok ? 1 : 0);
+    fprintf(file, "mqtt_tcp_ok=%d\n", state->mqtt_tcp_ok ? 1 : 0);
+    fprintf(file, "mqtt_detail=%s\n", state->mqtt_last_error);
+    fprintf(file, "power_sleeping=%d\n", state->power_sleeping ? 1 : 0);
+    fprintf(file, "game_status=%s\n", state->game_status);
+    fprintf(file, "client_id=%s\n", state->config.mqtt_client_id);
+    fprintf(file, "socket_init=0x%x\n", g_socket_init_result);
+    fprintf(file, "socket_last=0x%x\n", socketGetLastResult());
+    fprintf(file, "psm_init=0x%x\n", g_psm_init_result);
+    fprintf(file, "spsm_init=0x%x\n", g_spsm_init_result);
+    fprintf(file, "grcd_open=0x%x\n", screen_stream_get_grcd_open_result());
+    fprintf(file, "grcd_begin=0x%x\n", screen_stream_get_grcd_begin_result());
+    {
+        char stream_status[32];
+        screen_stream_get_status(stream_status, sizeof(stream_status));
+        fprintf(file, "screen_stream=%s\n", stream_status);
+        fprintf(file, "screen_rtsp_port=%u\n", screen_stream_port());
+    }
+    fprintf(file, "hid_init=0x%x\n", g_hid_init_result);
+    fprintf(file, "lbl_init=0x%x\n", g_lbl_init_result);
+    fprintf(file, "audctl_init=0x%x\n", g_audctl_init_result);
+    fprintf(file, "pminfo_init=0x%x\n", g_pminfo_init_result);
+    mutexUnlock(&state->lock);
+
+    fclose(file);
+}
+
+int main(int argc, char **argv) {
+    AppState state;
+    app_state_init(&state);
+    state.app_mode = AppMode_Sysmodule;
+    append_log("sysmodule boot");
+
+    if (!config_load(&state.config)) {
+        snprintf(state.config_status, sizeof(state.config_status), "no config");
+        app_state_push_log(&state, "No config, waiting");
+        append_log("config missing");
+    } else {
+        snprintf(state.config_status, sizeof(state.config_status), "loaded");
+        app_state_push_log(&state, "Config loaded");
+        append_log("config loaded");
+    }
+
+    apply_startup_delay(&state.config);
+    init_core_services(&state);
+    init_optional_services(&state);
+    screen_stream_start(&state);
+    init_power_guard(&state);
+
+    mqtt_service_start(&state);
+    append_log("mqtt thread started");
+
+    while (true) {
+        AppConfig loaded;
+        if (config_load(&loaded)) {
+            mutexLock(&state.lock);
+            state.config = loaded;
+            snprintf(state.config_status, sizeof(state.config_status), "loaded");
+            mutexUnlock(&state.lock);
+        }
+
+        mutexLock(&state.lock);
+        bool power_sleeping = state.power_sleeping;
+        mutexUnlock(&state.lock);
+
+        if (!power_sleeping) {
+            write_heartbeat(&state);
+            svcSleepThread(30ULL * 1000ULL * 1000ULL * 1000ULL);
+        } else {
+            svcSleepThread(1000ULL * 1000ULL * 1000ULL);
+        }
+    }
+
+    return 0;
+}
