@@ -2,6 +2,7 @@
 
 This changelog documents the original Switch Assistant releases
 and the additional changes introduced in the manuelgzz fork.
+
 ## [v1.11.0] - SD Card Storage Sensors
 
 ### Added
@@ -75,4 +76,3 @@ and the additional changes introduced in the manuelgzz fork.
 ## v1.0
 
 - Initial release.
-
