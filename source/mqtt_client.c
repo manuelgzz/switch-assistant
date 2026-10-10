@@ -44,6 +44,7 @@ typedef struct {
     char screen_rtsp_url[128];
     char player_controller_count[16];
     char player_controller[MAX_PLAYERS][32];
+    char operation_mode[16];
 } SensorSnapshot;
 
 typedef struct {
@@ -56,6 +57,7 @@ static MqttContext g_ctx = {0};
 
 static void sanitize_id(const char *input, char *output, size_t output_size);
 static const char *client_id_or_device(const AppConfig *config);
+static void state_topic(const AppConfig* config, const char* sensor, char* topic, size_t topic_size); // ◄— AGREGA ESTA LÍNEA AQUÍ
 
 static u64 monotonic_ms(void) {
     return armTicksToNs(armGetSystemTick()) / 1000000ULL;
@@ -288,14 +290,17 @@ static bool socket_recv_all(int fd, unsigned char *buffer, size_t size) {
     return true;
 }
 
-static bool mqtt_send_connect(const AppConfig *config, int fd) {
+static bool mqtt_send_connect(const AppConfig* config, int fd) {
     unsigned char packet[MQTT_BUFFER];
     unsigned char variable[MQTT_BUFFER];
-    unsigned char *ptr = variable;
+    unsigned char* ptr = variable;
 
     ptr = write_string(ptr, "MQTT");
     *ptr++ = 0x04;
-    unsigned char flags = 0x02;
+
+    // ✅ ACTIVAMOS LAS BANDERAS DE TESTAMENTO (Will) Y RETAIN PARA EL TESTAMENTO:
+    // 0x02 (Clean Session) + 0x04 (Will Flag) + 0x20 (Will Retain) = 0x26
+    unsigned char flags = 0x26;
     if (config->mqtt_username[0] != '\0') {
         flags |= 0x80;
     }
@@ -305,7 +310,16 @@ static bool mqtt_send_connect(const AppConfig *config, int fd) {
     *ptr++ = flags;
     *ptr++ = 0x00;
     *ptr++ = MQTT_KEEPALIVE;
+
+    // Payload estándar: Client ID
     ptr = write_string(ptr, config->mqtt_client_id[0] ? config->mqtt_client_id : config->device_name);
+
+    // ◄— VERIFICA QUE ESTAS TRES LÍNEAS QUEDEN ASÍ (Con el [192]):
+    char will_topic[192]; // ◄— Asegúrate de que tenga el [192] para que guarde el texto
+    state_topic(config, "operation_mode", will_topic, sizeof(will_topic));
+    ptr = write_string(ptr, will_topic);
+    ptr = write_string(ptr, "Sleep");
+
     if (config->mqtt_username[0] != '\0') {
         ptr = write_string(ptr, config->mqtt_username);
     }
@@ -313,9 +327,9 @@ static bool mqtt_send_connect(const AppConfig *config, int fd) {
         ptr = write_string(ptr, config->mqtt_password);
     }
 
-    size_t payload_len = (size_t) (ptr - variable);
+    size_t payload_len = (size_t)(ptr - variable);
     packet[0] = 0x10;
-    int remain = encode_remaining_length(packet + 1, (int) payload_len);
+    int remain = encode_remaining_length(packet + 1, (int)payload_len);
     memcpy(packet + 1 + remain, variable, payload_len);
     return mqtt_send_packet(fd, packet, 1 + remain + payload_len);
 }
@@ -873,6 +887,9 @@ static void publish_sensor_discovery(AppState *state, int fd, const AppConfig *c
         publish_discovery_sensor(fd, config, "sensor", "brightness", "Screen Brightness", NULL, "%", "measurement");
         publish_discovery_sensor(fd, config, "binary_sensor", "backlight", "Screen", NULL, NULL, NULL);
     }
+
+    publish_discovery_sensor(fd, config, "sensor", "operation_mode", "Operation Mode", NULL, NULL, NULL);
+
     if (state->svc_audctl_ready) {
         publish_discovery_sensor(fd, config, "sensor", "volume", "Volume", NULL, "%", "measurement");
         publish_discovery_sensor(fd, config, "sensor", "audio_target", "Audio Output Target", NULL, NULL, NULL);
@@ -902,6 +919,7 @@ static void publish_sensor_discovery(AppState *state, int fd, const AppConfig *c
         clear_discovery_topic(fd, config, "sensor", "screen_rtsp_port");
         clear_discovery_topic(fd, config, "camera", "screen_camera");
     }
+
     if (config->notification_overlay_enabled) {
         publish_discovery_notify(fd, config, "popup", "Popup Notification");
     } else {
@@ -1078,6 +1096,21 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
         publish_if_changed(fd, config, snapshot, force, SCREEN_RTSP_URL_SENSOR,
                            snapshot->screen_rtsp_url, sizeof(snapshot->screen_rtsp_url), stream_url);
     }
+
+    char current_mode[16];
+    if (power_sleeping) {
+        snprintf(current_mode, sizeof(current_mode), "Sleep");
+    }
+    else if (R_SUCCEEDED(psmGetChargerType(&charger)) && charger == PsmChargerType_EnoughPower) {
+        snprintf(current_mode, sizeof(current_mode), "Docked");
+    }
+    else {
+        snprintf(current_mode, sizeof(current_mode), "Handheld");
+    }
+
+    publish_if_changed(fd, config, snapshot, force, "operation_mode",
+        snapshot->operation_mode, sizeof(snapshot->operation_mode), current_mode);
+
     snapshot->initialized = true;
 }
 
@@ -1381,14 +1414,21 @@ static void mqtt_loop(void *arg) {
             }
 
             u64 now = monotonic_ms();
+            // ✅ REEMPLÁZALO CON ESTE BLOQUE:
             if (sensor_publish_requested || now - last_sensor_poll_ms >= SENSOR_POLL_INTERVAL_MS) {
                 publish_switch_sensors(state, fd, &config, &sensor_snapshot, false);
                 last_sensor_poll_ms = now;
             }
 
             if (power_sleeping) {
+                /* Forzamos el estado Sleep directamente en el broker antes de romper la conexión de red */
+                publish_value(fd, &config, "operation_mode", "Sleep");
+
+                /* Damos un margen de 20ms para asegurar que el paquete TCP salga de la consola */
+                svcSleepThread(20ULL * 1000ULL * 1000ULL);
                 break;
             }
+
 
             if (now - last_heartbeat_ms >= MQTT_HEARTBEAT_INTERVAL_MS) {
                 if (!mqtt_send_ping(fd)) {
@@ -1401,6 +1441,7 @@ static void mqtt_loop(void *arg) {
 
         if (!power_sleeping) {
             publish_state(state, fd, &config, "offline");
+            publish_value(fd, &config, "operation_mode", "Sleep"); // ◄— ESTA ES LA ÚNICA LÍNEA NUEVA
         }
         close(fd);
         g_ctx.socket_fd = -1;
