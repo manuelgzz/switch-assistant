@@ -122,9 +122,18 @@ static void init_core_services(AppState *state) {
     append_log("core service init done");
 }
 
-static void power_guard_thread_main(void *arg) {
-    AppState *state = arg;
+static void power_guard_thread_main(void* arg) {
+    AppState* state = arg;
     bool last_sleeping = false;
+    bool last_screen_off = false;
+    bool system_was_active_in_dock = false; /* Variable de control nueva */
+
+    /* DECLARACIÓN DE VARIABLES AL INICIO (Estricto de C) */
+    LblBacklightSwitchStatus backlight;
+    Result rc;
+    bool screen_off;
+    bool is_docked_by_state;
+    bool sleeping;
 
     while (true) {
         if (!state->svc_lbl_ready) {
@@ -132,25 +141,59 @@ static void power_guard_thread_main(void *arg) {
             continue;
         }
 
-        LblBacklightSwitchStatus backlight = LblBacklightSwitchStatus_Enabled;
-        Result rc = lblGetBacklightSwitchStatus(&backlight);
+        backlight = LblBacklightSwitchStatus_Enabled;
+        rc = lblGetBacklightSwitchStatus(&backlight);
         if (R_FAILED(rc)) {
             svcSleepThread(250ULL * 1000ULL * 1000ULL);
             continue;
         }
 
-        bool sleeping = backlight == LblBacklightSwitchStatus_Disabled ||
-                        backlight == LblBacklightSwitchStatus_Disabling;
+        screen_off = (backlight == LblBacklightSwitchStatus_Disabled ||
+            backlight == LblBacklightSwitchStatus_Disabling);
+
+        /* 1. SEGURO PARA EL RTSP STREAM: Pausa el video si la pantalla interna se apaga */
+        if (screen_off != last_screen_off) {
+            screen_stream_set_paused(screen_off);
+            last_screen_off = screen_off;
+        }
+
+        /* Lógica pasiva para identificar si estamos jugando activamente en el Dock */
+        is_docked_by_state = screen_off && !state->power_sleeping;
+        sleeping = screen_off && !is_docked_by_state;
+
+        /* Si la pantalla está apagada y detectamos que SÍ está activa en el Dock */
+        if (screen_off && is_docked_by_state) {
+            system_was_active_in_dock = true;
+        }
+
+        /* 2. EL CIERRE QUIRÚRGICO DE RED:
+           SOLO le mentimos al sistema si la consola estuvo activa en el Dock Y AHORA
+           el usuario decidió suspenderla de verdad (sleeping == true). Una sola ejecución. */
+        if (sleeping && system_was_active_in_dock) {
+            mutexLock(&state->lock);
+            state->power_sleeping = true;
+            state->sensor_publish_requested = true;
+            mutexUnlock(&state->lock);
+
+            /* Damos 150ms para que el cliente MQTT cierre los sockets de red limpiamente */
+            svcSleepThread(150ULL * 1000ULL * 1000ULL);
+
+            /* Reiniciamos la bandera de control */
+            system_was_active_in_dock = false;
+        }
+
+        /* 3. Gestión y actualización real del estado hacia Home Assistant */
         if (sleeping != last_sleeping) {
             mutexLock(&state->lock);
             state->power_sleeping = sleeping;
             state->sensor_publish_requested = true;
             mutexUnlock(&state->lock);
-            screen_stream_set_paused(sleeping);
             last_sleeping = sleeping;
         }
 
-        svcSleepThread(sleeping ? 1000ULL * 1000ULL * 1000ULL : 100ULL * 1000ULL * 1000ULL);
+        /* Si estás jugando en la TV (Dock), corre rápido (100ms) para reportar todo continuamente.
+           Si la consola está realmente suspendida en su totalidad, corre lento (2s) para no congelar la CPU. */
+        svcSleepThread(sleeping ? 2000ULL * 1000ULL * 1000ULL : 1000ULL * 100ULL * 100ULL);
     }
 }
 
