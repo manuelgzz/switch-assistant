@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <sys/statvfs.h>
 
 #define MQTT_BUFFER 2048
 #define MQTT_KEEPALIVE 30
@@ -45,6 +46,8 @@ typedef struct {
     char player_controller_count[16];
     char player_controller[MAX_PLAYERS][32];
     char operation_mode[16];
+    char sd_free[16];
+    char sd_used[16];
 } SensorSnapshot;
 
 typedef struct {
@@ -57,7 +60,7 @@ static MqttContext g_ctx = {0};
 
 static void sanitize_id(const char *input, char *output, size_t output_size);
 static const char *client_id_or_device(const AppConfig *config);
-static void state_topic(const AppConfig* config, const char* sensor, char* topic, size_t topic_size); // ◄— AGREGA ESTA LÍNEA AQUÍ
+static void state_topic(const AppConfig* config, const char* sensor, char* topic, size_t topic_size);
 
 static u64 monotonic_ms(void) {
     return armTicksToNs(armGetSystemTick()) / 1000000ULL;
@@ -298,8 +301,6 @@ static bool mqtt_send_connect(const AppConfig* config, int fd) {
     ptr = write_string(ptr, "MQTT");
     *ptr++ = 0x04;
 
-    // ✅ ACTIVAMOS LAS BANDERAS DE TESTAMENTO (Will) Y RETAIN PARA EL TESTAMENTO:
-    // 0x02 (Clean Session) + 0x04 (Will Flag) + 0x20 (Will Retain) = 0x26
     unsigned char flags = 0x26;
     if (config->mqtt_username[0] != '\0') {
         flags |= 0x80;
@@ -311,11 +312,9 @@ static bool mqtt_send_connect(const AppConfig* config, int fd) {
     *ptr++ = 0x00;
     *ptr++ = MQTT_KEEPALIVE;
 
-    // Payload estándar: Client ID
     ptr = write_string(ptr, config->mqtt_client_id[0] ? config->mqtt_client_id : config->device_name);
 
-    // ◄— VERIFICA QUE ESTAS TRES LÍNEAS QUEDEN ASÍ (Con el [192]):
-    char will_topic[192]; // ◄— Asegúrate de que tenga el [192] para que guarde el texto
+    char will_topic[192];
     state_topic(config, "operation_mode", will_topic, sizeof(will_topic));
     ptr = write_string(ptr, will_topic);
     ptr = write_string(ptr, "Sleep");
@@ -890,6 +889,9 @@ static void publish_sensor_discovery(AppState *state, int fd, const AppConfig *c
 
     publish_discovery_sensor(fd, config, "sensor", "operation_mode", "Operation Mode", NULL, NULL, NULL);
 
+    publish_discovery_sensor(fd, config, "sensor", "sd_free_space", "SD Free Space", NULL, "GB", "measurement");
+    publish_discovery_sensor(fd, config, "sensor", "sd_used_space", "SD Used Space", NULL, "GB", "measurement");
+
     if (state->svc_audctl_ready) {
         publish_discovery_sensor(fd, config, "sensor", "volume", "Volume", NULL, "%", "measurement");
         publish_discovery_sensor(fd, config, "sensor", "audio_target", "Audio Output Target", NULL, NULL, NULL);
@@ -1110,6 +1112,24 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
 
     publish_if_changed(fd, config, snapshot, force, "operation_mode",
         snapshot->operation_mode, sizeof(snapshot->operation_mode), current_mode);
+
+    struct statvfs vfs;
+    char size_val[32];
+
+    if (statvfs("sdmc:/", &vfs) == 0) {
+        u64 total_bytes_sd = (u64)vfs.f_blocks * (u64)vfs.f_frsize;
+        u64 free_bytes_sd = (u64)vfs.f_bavail * (u64)vfs.f_frsize;
+        u64 used_bytes_sd = (total_bytes_sd > free_bytes_sd) ? (total_bytes_sd - free_bytes_sd) : 0;
+
+        double free_sd_gb = (double)free_bytes_sd / (1024.0 * 1024.0 * 1024.0);
+        double used_sd_gb = (double)used_bytes_sd / (1024.0 * 1024.0 * 1024.0);
+
+        snprintf(size_val, sizeof(size_val), "%.2f", free_sd_gb);
+        publish_if_changed(fd, config, snapshot, force, "sd_free_space", snapshot->sd_free, sizeof(snapshot->sd_free), size_val);
+
+        snprintf(size_val, sizeof(size_val), "%.2f", used_sd_gb);
+        publish_if_changed(fd, config, snapshot, force, "sd_used_space", snapshot->sd_used, sizeof(snapshot->sd_used), size_val);
+    }
 
     snapshot->initialized = true;
 }
@@ -1414,17 +1434,14 @@ static void mqtt_loop(void *arg) {
             }
 
             u64 now = monotonic_ms();
-            // ✅ REEMPLÁZALO CON ESTE BLOQUE:
             if (sensor_publish_requested || now - last_sensor_poll_ms >= SENSOR_POLL_INTERVAL_MS) {
                 publish_switch_sensors(state, fd, &config, &sensor_snapshot, false);
                 last_sensor_poll_ms = now;
             }
 
             if (power_sleeping) {
-                /* Forzamos el estado Sleep directamente en el broker antes de romper la conexión de red */
                 publish_value(fd, &config, "operation_mode", "Sleep");
 
-                /* Damos un margen de 20ms para asegurar que el paquete TCP salga de la consola */
                 svcSleepThread(20ULL * 1000ULL * 1000ULL);
                 break;
             }
@@ -1441,7 +1458,7 @@ static void mqtt_loop(void *arg) {
 
         if (!power_sleeping) {
             publish_state(state, fd, &config, "offline");
-            publish_value(fd, &config, "operation_mode", "Sleep"); // ◄— ESTA ES LA ÚNICA LÍNEA NUEVA
+            publish_value(fd, &config, "operation_mode", "Sleep");
         }
         close(fd);
         g_ctx.socket_fd = -1;
