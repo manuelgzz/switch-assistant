@@ -25,6 +25,17 @@
       src="https://img.shields.io/badge/HB%20App%20Store-Download%20Now-009400?style=for-the-badge">
   </a>
 </p>
+A special thanks to ErSeraph, the original creator of Switch Assistant.
+
+This project would not exist without the time, dedication, and effort invested in developing the original Switch Assistant. Your work has provided an excellent foundation for integrating the Nintendo Switch with Home Assistant and inspired me to explore new possibilities and improvements.
+
+This repository is a personal fork of the original project, with additional features, sensors, and improvements developed to expand its functionality while preserving the original vision.
+
+All credit for the original project, its architecture, and its core functionality belongs to ErSeraph.
+
+Thank you for sharing your work with the community and making it possible for others to learn from it, build upon it, and contribute their own improvements.
+
+With appreciation and respect for the original developer and their work.
 
 Switch Assistant connects your Nintendo Switch to Home Assistant through MQTT.
 
