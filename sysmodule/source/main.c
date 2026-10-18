@@ -376,7 +376,12 @@ int main(int argc, char **argv) {
     apply_startup_delay(&state.config);
     init_core_services(&state);
     init_optional_services(&state);
-    screen_stream_start(&state);
+    if (state.config.rtsp_enabled) {
+        screen_stream_start(&state);
+        append_log("rtsp enabled");
+    } else {
+        append_log("rtsp disabled");
+    }
     init_power_guard(&state);
 
     mqtt_service_start(&state);

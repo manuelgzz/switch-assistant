@@ -77,6 +77,7 @@ void config_set_defaults(AppConfig *config) {
     snprintf(config->device_name, sizeof(config->device_name), "Nintendo Switch");
     config->startup_delay_seconds = 0;
     config->notification_overlay_enabled = 1;
+    config->rtsp_enabled = 0;
     config_generate_client_id(config);
 }
 
@@ -92,6 +93,7 @@ bool config_load(AppConfig *config) {
 
     char line[512];
     bool found_notification_overlay_enabled = false;
+    bool found_rtsp_enabled = false;
     while (fgets(line, sizeof(line), file)) {
         trim_eol(line);
         char *sep = strchr(line, '=');
@@ -127,11 +129,14 @@ bool config_load(AppConfig *config) {
         } else if (strcmp(key, "notification_overlay_enabled") == 0) {
             config->notification_overlay_enabled = atoi(value) != 0 ? 1 : 0;
             found_notification_overlay_enabled = true;
+        } else if (strcmp(key, "rtsp_enabled") == 0) {
+            config->rtsp_enabled = atoi(value) != 0 ? 1 : 0;
+            found_rtsp_enabled = true;
         }
     }
 
     fclose(file);
-    g_last_load_needs_save = !found_notification_overlay_enabled;
+    g_last_load_needs_save = !found_notification_overlay_enabled || !found_rtsp_enabled;
     snprintf(g_last_error, sizeof(g_last_error), "no error");
     return true;
 }
@@ -158,6 +163,7 @@ bool config_save(const AppConfig *config) {
     fprintf(file, "device_name=%s\n", config->device_name);
     fprintf(file, "startup_delay_seconds=%d\n", clamp_startup_delay(config->startup_delay_seconds));
     fprintf(file, "notification_overlay_enabled=%d\n", config->notification_overlay_enabled ? 1 : 0);
+    fprintf(file, "rtsp_enabled=%d\n", config->rtsp_enabled ? 1 : 0);
 
     if (fflush(file) != 0) {
         set_error("flush config failed");

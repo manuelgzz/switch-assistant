@@ -114,6 +114,8 @@ static void draw_ui(AppState *state, int selected) {
     printf(C_BOLD "System" C_RESET "\n");
     printf("%s Boot Delay: %d sec\n", cursor(selected, 9), state->config.startup_delay_seconds);
     printf("%s Notifications: %s\n", cursor(selected, 10), yes_no(state->config.notification_overlay_enabled));
+    printf("%s RTSP (risky): %s\n", cursor(selected, 11), yes_no(state->config.rtsp_enabled));
+    printf(C_YELLOW "  RTSP can affect games; enable at your own risk." C_RESET "\n");
     printf("\n");
 
     printf(C_BOLD "Status" C_RESET "  " C_DIM "config %s" C_RESET "\n", state->config_status);
@@ -141,7 +143,7 @@ void ui_run(AppState *state) {
     padInitializeDefault(&pad);
 
     int selected = 0;
-    const int field_count = 11;
+    const int field_count = 12;
 
     while (appletMainLoop()) {
         padUpdate(&pad);
@@ -215,6 +217,10 @@ void ui_run(AppState *state) {
                     tmp.notification_overlay_enabled = tmp.notification_overlay_enabled ? 0 : 1;
                     changed = true;
                     break;
+                case 11:
+                    tmp.rtsp_enabled = tmp.rtsp_enabled ? 0 : 1;
+                    changed = true;
+                    break;
             }
 
             if (changed) {
@@ -227,6 +233,8 @@ void ui_run(AppState *state) {
                 save_config_with_status(state, &tmp);
                 if (selected == 10) {
                     notification_overlay_apply(state);
+                } else if (selected == 11) {
+                    app_state_push_log(state, "RTSP %s; reboot required", tmp.rtsp_enabled ? "enabled" : "disabled");
                 }
             }
         }
