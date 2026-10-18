@@ -3,6 +3,24 @@
 This changelog documents the original Switch Assistant releases
 and the additional changes introduced in the manuelgzz fork.
 
+## [v1.12.0] - Opt-in RTSP Control
+
+### Changed
+- RTSP screen streaming is disabled by default to avoid starting the RTSP
+  capture subsystem on every console boot.
+- Added **System > RTSP (risky)** in Switch Assistant to explicitly enable or
+  disable RTSP.
+- The setting is saved as `rtsp_enabled` in `config.ini` and requires a
+  console reboot to apply.
+
+### Fixed
+- Prevented the RTSP capture subsystem from starting when it is not in use,
+  avoiding the instability observed while launching games on affected consoles.
+
+### Documentation
+- Added `docs/rtsp-investigation.md` with the investigation evidence, test
+  procedure, limitations, and follow-up plan.
+
 ## [v1.11.0] - SD Card Storage Sensors
 
 ### Added
