@@ -73,9 +73,10 @@ static void extended_discovery(AppState *state, int fd, const AppConfig *c) {
     ext_entity(fd,c,"switch","mute","Mute",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
     clear_discovery_topic(fd,c,"switch","stream_enabled");
     clear_discovery_topic(fd,c,"button","sleep");
+    clear_discovery_topic(fd,c,"button","close_game");
     ext_entity(fd,c,"sensor","stream_clients","RTSP clients","",false);
     ext_entity(fd,c,"sensor","stream_error","RTSP capture result","",false);
-    const char *buttons[][2]={{"volume_up","Volume up"},{"volume_down","Volume down"},{"get_logs","Fetch diagnostics"},{"refresh","Refresh sensors"},{"close_game","Close game"},{"refresh_games","Refresh installed games"}};
+    const char *buttons[][2]={{"volume_up","Volume up"},{"volume_down","Volume down"},{"get_logs","Fetch diagnostics"},{"refresh","Refresh sensors"},{"refresh_games","Refresh installed games"}};
     for(size_t i=0;i<sizeof(buttons)/sizeof(buttons[0]);i++) ext_entity(fd,c,"button",buttons[i][0],buttons[i][1],",\"payload_press\":\"PRESS\"",true);
     ext_entity(fd,c,"event","overlay_action","Overlay action",",\"event_types\":[\"quick_action_1\",\"quick_action_2\",\"quick_action_3\",\"quick_action_4\"]",false);
     const char *sensors[][3]={{"uptime","Console uptime",",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\""},{"mqtt_reconnections","MQTT reconnections",""},{"mqtt_session","MQTT session duration",",\"unit_of_meas\":\"s\""},{"soc_temperature","Internal temperature",",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\""},{"wifi_bars","Wi-Fi signal bars",",\"icon\":\"mdi:wifi\""},{"connection_type","Connection type",""},{"process_memory","Sysmodule memory",",\"unit_of_meas\":\"MiB\""},{"sd_total","SD capacity",",\"unit_of_meas\":\"GiB\""},{"internal_free","Internal free space",",\"unit_of_meas\":\"GiB\""},{"internal_total","Internal capacity",",\"unit_of_meas\":\"GiB\""},{"game_session","Game session duration",",\"unit_of_meas\":\"s\""},{"stream_status","RTSP status",""},{"command_status","Last command result",""}};
@@ -270,8 +271,17 @@ static void ext_diagnostics(AppState*s,int fd,const AppConfig*c) {
     publish_value(fd,c,"diagnostics","reported");
 }
 
+static bool ext_reject_unsafe_command(int fd, const AppConfig *config, const char *command) {
+    if (strcasecmp(command, "close_game") == 0 || strcasecmp(command, "close") == 0 || strcasecmp(command, "exit_game") == 0) {
+        publish_value(fd, config, "command_status", "close_game:disabled_unsafe_termination");
+        return true;
+    }
+    return false;
+}
+
 static bool extended_command(AppState*s,int fd,const AppConfig*c,const char*kind,const char*payload) {
     const char *cmd=strcmp(kind,"command")==0?payload:kind;
+    if(ext_reject_unsafe_command(fd,c,cmd)) return true;
     Result rc=MAKERESULT(Module_Libnx,LibnxError_NotInitialized);
     if(strcmp(cmd,"stream_enabled")==0) {
         publish_value(fd,c,"command_status","stream_enabled:removed");
@@ -311,8 +321,6 @@ static bool extended_command(AppState*s,int fd,const AppConfig*c,const char*kind
              * Keep the error/availability explicit until a background launch service exists. */
             break;
         }
-    } else if(strcmp(cmd,"close_game")==0) {
-        rc=game_query_close_current();
     } else if(strcmp(cmd,"sleep")==0 || strcmp(cmd,"standby")==0) {
         /* Disabled after a console crash. Never invoke privileged sleep from MQTT. */
         publish_value(fd,c,"command_status","sleep:disabled");

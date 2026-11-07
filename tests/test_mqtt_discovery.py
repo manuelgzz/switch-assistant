@@ -79,6 +79,7 @@ int main(void) {
             packets.append((topic, json.loads(payload, object_pairs_hook=unique)))
         self.assertGreater(len(packets), 40)
         self.assertIn("homeassistant/button/switch_a/sleep/config", removed)
+        self.assertIn("homeassistant/button/switch_a/close_game/config", removed)
         self.assertIn("homeassistant/switch/switch_a/stream_enabled/config", removed)
         a, b = packets[0][1], packets[1][1]
         self.assertNotEqual(a["cmd_t"], b["cmd_t"])
@@ -100,6 +101,7 @@ int main(void) {
                 self.assertTrue(entity["cmd_t"].startswith("switch_ha/switch_a/control/"))
             self.assertNotIn("daybreak", topic)
             self.assertNotIn("/sleep/", topic)
+            self.assertNotIn("/close_game/", topic)
             self.assertNotIn("/stream_enabled/", topic)
         for topic, entity in packets[-3:]:
             self.assertEqual(entity["avty_t"], "switch_ha/switch_a/availability")

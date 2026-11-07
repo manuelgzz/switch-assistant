@@ -35,9 +35,8 @@ opcionales añaden disponibilidad por servicio a sus entidades.
 | `refresh` | `PRESS` | Solicitar publicación de sensores |
 | `get_logs` | `PRESS` | Diagnóstico y lista acotada de mensajes técnicos |
 | `refresh_games` | `PRESS` | Escanear juegos y publicar selectores |
-| `close_game` | `PRESS` | Terminar el juego identificado; puede perder progreso no guardado |
 
-Los comandos generales `reboot`, `shutdown`, `close_game`, `get_logs`,
+Los comandos generales `reboot`, `shutdown`, `get_logs`,
 `volume_up`, `volume_down`, `refresh` y `refresh_games` también se aceptan en `/command`.
 `command_status` informa el resultado de la llamada a la API y su código hexadecimal;
 no confirma que una transición física haya terminado. La suspensión remota está deshabilitada tras un fallo en consola: `sleep` y
@@ -211,3 +210,19 @@ El sensor Title ID ya reportaba el identificador correcto; no se cambia su
 formato. Instalar el NRO nuevo abriendo Switch Assistant y reiniciar para actualizar
 también el catálogo incrustado y el sysmodule. Guardar la partida antes de probar
 Close Game, porque termina la aplicación.
+
+
+## Cierre forzado retirado: 1.12.1-fix4
+
+La llamada `pmshellTerminateProcess` de fix3 terminaba el proceso, lo que Horizon
+puede presentar como «el programa se cerró a causa de un error». No equivalía a
+solicitar una salida normal. Se retira ese código y el botón Close Game; su
+configuración MQTT retenida se borra cuando el sysmodule nuevo reconecta.
+Los comandos `close_game`, `close` y `exit_game`, tanto generales como en el
+namespace de controles, responden `close_game:disabled_unsafe_termination` y no
+llaman a ninguna API de terminación. El cierre normal desde el sysmodule queda
+pendiente de un mecanismo compatible; no se oculta ni modifica el error de Horizon.
+
+Instalar el NRO fix4 abriendo Switch Assistant y reiniciar. Los cambios de fix3
+para nombres de juegos y el índice del catálogo se conservan. El apartado de
+fix3 documenta el comportamiento anterior, sustituido por esta corrección.
