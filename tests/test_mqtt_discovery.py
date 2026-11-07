@@ -103,6 +103,10 @@ int main(void) {
             self.assertNotIn("/sleep/", topic)
             self.assertNotIn("/close_game/", topic)
             self.assertNotIn("/stream_enabled/", topic)
+        screens = [entity for topic, entity in packets if topic == "homeassistant/switch/switch_a/screen/config"]
+        self.assertEqual(len(screens), 1)
+        self.assertEqual(screens[0]["name"], "Screen")
+        self.assertEqual(screens[0]["uniq_id"], "switch_a_ext_screen")
         for topic, entity in packets[-3:]:
             self.assertEqual(entity["avty_t"], "switch_ha/switch_a/availability")
             self.assertNotIn("avty", entity)

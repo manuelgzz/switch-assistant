@@ -69,7 +69,7 @@ static void extended_discovery(AppState *state, int fd, const AppConfig *c) {
     ext_next_poll=0;
     ext_entity(fd,c,"number","set_brightness","Brightness control",",\"min\":0,\"max\":100,\"step\":1,\"unit_of_meas\":\"%\"",true);
     ext_entity(fd,c,"number","set_volume","Volume control",",\"min\":0,\"max\":100,\"step\":1,\"unit_of_meas\":\"%\"",true);
-    ext_entity(fd,c,"switch","screen","Screen control",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
+    ext_entity(fd,c,"switch","screen","Screen",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
     ext_entity(fd,c,"switch","mute","Mute",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
     clear_discovery_topic(fd,c,"switch","stream_enabled");
     clear_discovery_topic(fd,c,"button","sleep");
