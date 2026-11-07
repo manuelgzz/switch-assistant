@@ -107,9 +107,14 @@ int main(void) {
         self.assertEqual(len(screens), 1)
         self.assertEqual(screens[0]["name"], "Screen")
         self.assertEqual(screens[0]["uniq_id"], "switch_a_ext_screen")
-        for topic, entity in packets[-3:]:
-            self.assertEqual(entity["avty_t"], "switch_ha/switch_a/availability")
-            self.assertNotIn("avty", entity)
+        telemetry_count = 0
+        for topic, entity in packets:
+            if "/sensor/" in topic or "/binary_sensor/" in topic:
+                telemetry_count += 1
+                self.assertNotIn("avty_t", entity)
+                self.assertNotIn("avty", entity)
+                self.assertNotIn("expire_after", entity)
+        self.assertGreater(telemetry_count, 30)
         print(f"Validated {len(packets)} discovery payloads")
 
 

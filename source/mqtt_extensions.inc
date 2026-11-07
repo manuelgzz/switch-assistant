@@ -58,7 +58,8 @@ static void ext_entity(int fd, const AppConfig *c, const char *type, const char 
         char *start=strstr(payload,",\"stat_t\":");
         if(start) {char *end=strstr(start+1,",\"dev\":");if(end)memmove(start,end,strlen(end)+1);}
     }
-    ext_availability(c,id,payload,sizeof(payload));
+    if(strcmp(type,"sensor")!=0 && strcmp(type,"binary_sensor")!=0)
+        ext_availability(c,id,payload,sizeof(payload));
     mqtt_send_publish(fd, topic, payload, true);
 }
 
@@ -81,6 +82,7 @@ static void extended_discovery(AppState *state, int fd, const AppConfig *c) {
     ext_entity(fd,c,"event","overlay_action","Overlay action",",\"event_types\":[\"quick_action_1\",\"quick_action_2\",\"quick_action_3\",\"quick_action_4\"]",false);
     const char *sensors[][3]={{"uptime","Console uptime",",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\""},{"mqtt_reconnections","MQTT reconnections",""},{"mqtt_session","MQTT session duration",",\"unit_of_meas\":\"s\""},{"soc_temperature","Internal temperature",",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\""},{"wifi_bars","Wi-Fi signal bars",",\"icon\":\"mdi:wifi\""},{"connection_type","Connection type",""},{"process_memory","Sysmodule memory",",\"unit_of_meas\":\"MiB\""},{"sd_total","SD capacity",",\"unit_of_meas\":\"GiB\""},{"internal_free","Internal free space",",\"unit_of_meas\":\"GiB\""},{"internal_total","Internal capacity",",\"unit_of_meas\":\"GiB\""},{"game_session","Game session duration",",\"unit_of_meas\":\"s\""},{"stream_status","RTSP status",""},{"command_status","Last command result",""}};
     for(size_t i=0;i<sizeof(sensors)/sizeof(sensors[0]);i++) ext_entity(fd,c,"sensor",sensors[i][0],sensors[i][1],sensors[i][2],false);
+    ext_entity(fd,c,"sensor","power_events","Power event listener",",\"ent_cat\":\"diagnostic\"",false);
     ext_entity(fd,c,"sensor","game_query_status","Game detection diagnostic",",\"ent_cat\":\"diagnostic\"",false);
     ext_entity(fd,c,"binary_sensor","docked","Docked","",false);
     char diagnostic_topic[192],diagnostic_extra[320];
@@ -116,6 +118,7 @@ static void extended_poll(AppState *s,int fd,const AppConfig*c) {
             if(mqtt_send_publish(fd,topic,json,false))remove("sdmc:/switch/switch-ha/overlay-command.ini");
         } else remove("sdmc:/switch/switch-ha/overlay-command.ini");
     }
+    publish_value(fd,c,"power_events",s->svc_psc_ready?"ready":"unavailable");
     const char *caps[]={"lbl","audctl","hid","pminfo","ts","nifm","launch"};
     bool ready[]={s->svc_lbl_ready,s->svc_audctl_ready,s->svc_hid_ready,s->svc_pminfo_ready,ext_ts,ext_nifm,s->app_mode==AppMode_ForegroundApp && (appletGetAppletType()==AppletType_Application || appletGetAppletType()==AppletType_LibraryApplet)};
     for(size_t i=0;i<7;i++){char topic[40];snprintf(topic,sizeof(topic),"capability/%s",caps[i]);publish_value(fd,c,topic,ready[i]?"online":"offline");}

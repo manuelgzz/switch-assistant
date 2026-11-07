@@ -3,6 +3,7 @@
 #include "mqtt_client.h"
 #include "screen_stream.h"
 #include "runtime_version.h"
+#include "power_policy.h"
 
 #include <switch.h>
 #include <stdio.h>
@@ -128,65 +129,102 @@ static void init_core_services(AppState *state) {
 }
 
 static void power_guard_thread_main(void* arg) {
-    AppState* state = arg;
-    bool last_sleeping = false;
-    bool last_screen_off = false;
-    bool system_was_active_in_dock = false;
-
-    LblBacklightSwitchStatus backlight;
-    Result rc;
-    bool screen_off;
-    bool is_docked_by_state;
-    bool sleeping;
+    AppState *state = arg;
+    PscPmModule module = {0};
+    bool registered = false;
+    bool psc_ready = false;
+    bool sm_ready = R_SUCCEEDED(smInitialize());
+    if (sm_ready) {
+        Result rc = pscmInitialize();
+        psc_ready = R_SUCCEEDED(rc);
+        if (psc_ready) {
+            /* Private module ID, not an impersonation of a system power module.
+             * Dependencies keep sockets/network and FS awake until our reply. */
+            const u32 dependencies[] = {PscPmModuleId_WlanSockets, PscPmModuleId_Nifm, PscPmModuleId_Fs};
+            rc = pscmGetPmModule(&module, (PscPmModuleId)0xE3, dependencies,
+                                sizeof(dependencies) / sizeof(dependencies[0]), true);
+            registered = R_SUCCEEDED(rc);
+        }
+        append_log_result("power_events_init", rc);
+    }
+    mutexLock(&state->lock);
+    state->svc_psc_ready = registered;
+    mutexUnlock(&state->lock);
 
     while (true) {
-        if (!state->svc_lbl_ready) {
-            svcSleepThread(1000ULL * 1000ULL * 1000ULL);
-            continue;
+        mutexLock(&state->lock);
+        bool exit_requested = state->exit_requested;
+        mutexUnlock(&state->lock);
+        if (exit_requested) break;
+
+        if (registered && R_SUCCEEDED(eventWait(&module.event, 100000000ULL))) {
+            PscPmState request;
+            u32 flags;
+            Result rc = pscPmModuleGetRequest(&module, &request, &flags);
+            if (R_SUCCEEDED(rc)) {
+                mutexLock(&state->lock);
+                bool previous = state->power_sleeping;
+                bool sleeping = power_policy_sleeping(request, previous);
+                state->power_sleeping = sleeping;
+                if (sleeping != previous) {
+                    state->mqtt_sleep_publish_finished = false;
+                    state->sensor_publish_requested = true;
+                }
+                mutexUnlock(&state->lock);
+                if (sleeping && !previous) {
+                    screen_stream_set_paused(true);
+                    /* Never hold up Horizon indefinitely if MQTT/network is busy.
+                     * The MQTT thread owns its socket and signals after flushing. */
+                    u64 deadline = monotonic_ms() + 500;
+                    while (monotonic_ms() < deadline) {
+                        mutexLock(&state->lock);
+                        bool finished = state->mqtt_sleep_publish_finished || !state->mqtt_connected;
+                        mutexUnlock(&state->lock);
+                        if (finished) break;
+                        svcSleepThread(10000000ULL);
+                    }
+                }
+                rc = pscPmModuleAcknowledge(&module, request);
+                if (R_FAILED(rc)) {
+                    append_log_result("power_event_ack", rc);
+                    pscPmModuleFinalize(&module);
+                    pscPmModuleClose(&module);
+                    registered = false;
+                }
+            } else {
+                append_log_result("power_event_read", rc);
+                pscPmModuleFinalize(&module);
+                pscPmModuleClose(&module);
+                registered = false;
+            }
+            if (!registered) {
+                mutexLock(&state->lock);
+                state->svc_psc_ready = false;
+                state->power_sleeping = false;
+                mutexUnlock(&state->lock);
+            }
+        } else if (!registered) {
+            svcSleepThread(100000000ULL);
         }
 
-        backlight = LblBacklightSwitchStatus_Enabled;
-        rc = lblGetBacklightSwitchStatus(&backlight);
-        if (R_FAILED(rc)) {
-            svcSleepThread(250ULL * 1000ULL * 1000ULL);
-            continue;
+        /* Backlight controls capture only. Screen Off is not console Sleep. */
+        mutexLock(&state->lock);
+        bool sleeping = state->power_sleeping;
+        mutexUnlock(&state->lock);
+        bool screen_off = false;
+        if (state->svc_lbl_ready && !sleeping) {
+            LblBacklightSwitchStatus backlight;
+            if (R_SUCCEEDED(lblGetBacklightSwitchStatus(&backlight)))
+                screen_off = backlight == LblBacklightSwitchStatus_Disabled || backlight == LblBacklightSwitchStatus_Disabling;
         }
-
-        screen_off = (backlight == LblBacklightSwitchStatus_Disabled ||
-            backlight == LblBacklightSwitchStatus_Disabling);
-
-        if (screen_off != last_screen_off) {
-            screen_stream_set_paused(screen_off);
-            last_screen_off = screen_off;
-        }
-
-        is_docked_by_state = screen_off && !state->power_sleeping;
-        sleeping = screen_off && !is_docked_by_state;
-
-        if (screen_off && is_docked_by_state) {
-            system_was_active_in_dock = true;
-        }
-
-        if (sleeping && system_was_active_in_dock) {
-            mutexLock(&state->lock);
-            state->power_sleeping = true;
-            state->sensor_publish_requested = true;
-            mutexUnlock(&state->lock);
-
-            svcSleepThread(150ULL * 1000ULL * 1000ULL);
-            system_was_active_in_dock = false;
-        }
-
-        if (sleeping != last_sleeping) {
-            mutexLock(&state->lock);
-            state->power_sleeping = sleeping;
-            state->sensor_publish_requested = true;
-            mutexUnlock(&state->lock);
-            last_sleeping = sleeping;
-        }
-
-        svcSleepThread(sleeping ? 2000ULL * 1000ULL * 1000ULL : 1000ULL * 100ULL * 100ULL);
+        screen_stream_set_paused(sleeping || screen_off);
     }
+    if (registered) {
+        pscPmModuleFinalize(&module);
+        pscPmModuleClose(&module);
+    }
+    if (psc_ready) pscmExit();
+    if (sm_ready) smExit();
 }
 
 
@@ -341,6 +379,7 @@ static void write_heartbeat(AppState *state) {
     fprintf(file, "mqtt_tcp_ok=%d\n", state->mqtt_tcp_ok ? 1 : 0);
     fprintf(file, "mqtt_detail=%s\n", state->mqtt_last_error);
     fprintf(file, "power_sleeping=%d\n", state->power_sleeping ? 1 : 0);
+    fprintf(file, "power_events_ready=%d\n", state->svc_psc_ready ? 1 : 0);
     fprintf(file, "game_status=%s\n", state->game_status);
     fprintf(file, "client_id=%s\n", state->config.mqtt_client_id);
     fprintf(file, "socket_init=0x%x\n", g_socket_init_result);

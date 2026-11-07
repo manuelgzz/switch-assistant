@@ -19,9 +19,12 @@ Ese topic compartido ya no se suscribe, para evitar controlar varias consolas a 
 Los comandos y acciones no deben publicarse con `retain: true`: se rechazan.
 Los estados y discovery sí se retienen.
 
-La disponibilidad usa `switch_ha/<id>/availability` con `online`/`offline` y
-último testamento MQTT. Una pérdida de red ya no significa `Sleep`. Los servicios
-opcionales añaden disponibilidad por servicio a sus entidades.
+Los controles usan `switch_ha/<id>/availability` con `online`/`offline` y
+último testamento MQTT; los que requieren servicios opcionales también comprueban
+su disponibilidad. Los sensores y sensores binarios no dependen de esa disponibilidad:
+conservan su último estado retenido durante la suspensión o una desconexión.
+Es una última lectura conocida, no una medición nueva mientras la consola duerme.
+Una pérdida de red por sí sola no cambia `Operation Mode` a `Sleep`.
 
 ## Controles
 
@@ -226,3 +229,37 @@ pendiente de un mecanismo compatible; no se oculta ni modifica el error de Horiz
 Instalar el NRO fix4 abriendo Switch Assistant y reiniciar. Los cambios de fix3
 para nombres de juegos y el índice del catálogo se conservan. El apartado de
 fix3 documenta el comportamiento anterior, sustituido por esta corrección.
+
+
+## Suspensión y últimas lecturas: 1.12.1-fix5
+
+El detector anterior infería la suspensión a partir de la retroiluminación y no
+podía distinguir correctamente una pantalla apagada de la suspensión real.
+Se sustituye por un listener de notificaciones de energía `psc:m`, con un ID
+privado `0xE3` y dependencias de sockets, red y filesystem. Solo los eventos de
+preparación de suspensión cambian `power_sleeping`; apagar Screen no lo hace.
+No se añade ninguna llamada para provocar la suspensión ni se vuelve a habilitar
+el botón Sleep.
+
+Antes de confirmar la preparación de suspensión a Horizon, el hilo MQTT:
+
+1. Detiene las consultas de sensores para conservar las últimas lecturas.
+2. Publica el estado de conexión `sleep` y disponibilidad de controles `offline`.
+3. Publica `operation_mode=Sleep` con retención y QoS 1.
+4. Espera brevemente el PUBACK de ese paquete y envía MQTT DISCONNECT.
+
+El listener de energía espera como máximo 500 ms al hilo MQTT antes de confirmar
+un evento leído correctamente; si falla la lectura o confirmación, se desregistra.
+Un broker sin respuesta no debe bloquear la suspensión del sistema.
+La publicación solo puede llegar si la conexión y el broker están operativos.
+Si falla el listener, se desregistra y no se inventa un estado de suspensión.
+`Power event listener` indica `ready` o `unavailable`, y el heartbeat registra
+`power_events_ready`. Al reanudarse la consola se reconecta y publica todas las
+lecturas otra vez.
+
+Las pruebas ejercitan los constructores de discovery sin disponibilidad en
+telemetría, la conservación de disponibilidad en controles, los eventos de energía,
+el límite de espera y desregistro en caso de error. Un peer MQTT local verifica
+los paquetes retenidos, el PUBACK exacto, DISCONNECT y que una desconexión ordinaria
+no sobrescriba el modo ni los valores de batería/juego/audio. La recepción de eventos
+reales y el ciclo de suspensión/reanudación necesitan validación en consola.

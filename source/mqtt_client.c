@@ -18,6 +18,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
+#include <sys/time.h>
 
 #define MQTT_BUFFER 2048
 #define MQTT_KEEPALIVE 30
@@ -825,7 +826,7 @@ static void publish_discovery_sensor(int fd, const AppConfig *config, const char
         }
     }
 
-    ext_availability(config, sensor, payload, sizeof(payload));
+    /* Telemetry keeps its last retained reading even while MQTT is offline. */
     mqtt_send_publish(fd, topic, payload, true);
 }
 
@@ -975,6 +976,7 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     mutexLock(&state->lock);
     bool power_sleeping = state->power_sleeping;
     mutexUnlock(&state->lock);
+    if (power_sleeping) return;
 
     if (R_SUCCEEDED(psmGetBatteryChargePercentage(&percent))) {
         snprintf(value, sizeof(value), "%u", percent);
@@ -1146,7 +1148,43 @@ static void publish_state(AppState *state, int fd, const AppConfig *config, cons
              state->ha_validated ? "true" : "false");
     mqtt_send_publish(fd, topic, payload, true);
     state_topic(config, "availability", topic, sizeof(topic));
-    mqtt_send_publish(fd, topic, status, true);
+    mqtt_send_publish(fd, topic, strcmp(status,"online")==0?"online":"offline", true);
+}
+
+static bool mqtt_publish_sleep(AppState *state, int fd, const AppConfig *config) {
+    /* This function deliberately publishes no battery/game/audio readings. */
+    struct timeval timeout = {.tv_sec=0, .tv_usec=100000};
+    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
+    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
+    publish_state(state, fd, config, "sleep");
+    char topic[192];
+    state_topic(config,"operation_mode",topic,sizeof(topic));
+    unsigned char body[256],packet[272];
+    unsigned char *end=write_string(body,topic);
+    *end++=0x53; *end++=0x48; /* Dedicated packet identifier: "SH". */
+    memcpy(end,"Sleep",5); end+=5;
+    packet[0]=0x33; /* Retained PUBLISH, QoS 1. */
+    int length_bytes=encode_remaining_length(packet+1,(int)(end-body));
+    memcpy(packet+1+length_bytes,body,(size_t)(end-body));
+    bool flushed = false;
+    if (mqtt_send_packet(fd,packet,1+length_bytes+(size_t)(end-body))) {
+        u64 deadline = monotonic_ms() + 200;
+        while (monotonic_ms() < deadline) {
+            struct pollfd pfd = {.fd=fd,.events=POLLIN};
+            if (poll(&pfd,1,25) <= 0) continue;
+            unsigned char packet[MQTT_BUFFER];
+            int size = mqtt_read_frame(fd,packet,sizeof(packet),socket_recv_all);
+            if (size <= 0) break;
+            /* Only this PUBACK confirms storage of our retained Sleep state. */
+            if (size==4 && packet[0]==0x40 && packet[1]==2 && packet[2]==0x53 && packet[3]==0x48) {flushed=true;break;}
+        }
+    }
+    const unsigned char disconnect[] = {0xe0,0x00};
+    mqtt_send_packet(fd,disconnect,sizeof(disconnect));
+    mutexLock(&state->lock);
+    state->mqtt_sleep_publish_finished = true;
+    mutexUnlock(&state->lock);
+    return flushed;
 }
 
 static bool read_mqtt_remaining_length(const unsigned char *buffer, int size, int *value, int *bytes_used) {
@@ -1448,19 +1486,13 @@ static void mqtt_loop(void *arg) {
                 break;
             }
 
+            if (power_sleeping) break;
+
             u64 now = monotonic_ms();
             if (sensor_publish_requested || now - last_sensor_poll_ms >= SENSOR_POLL_INTERVAL_MS) {
                 publish_switch_sensors(state, fd, &config, &sensor_snapshot, false);
                 last_sensor_poll_ms = now;
             }
-
-            if (power_sleeping) {
-                publish_value(fd, &config, "operation_mode", "Sleep");
-
-                svcSleepThread(20ULL * 1000ULL * 1000ULL);
-                break;
-            }
-
 
             if (now - last_heartbeat_ms >= MQTT_HEARTBEAT_INTERVAL_MS) {
                 if (!mqtt_send_ping(fd)) {
@@ -1471,7 +1503,15 @@ static void mqtt_loop(void *arg) {
             }
         }
 
-        publish_state(state, fd, &config, "offline");
+        mutexLock(&state->lock);
+        power_sleeping = state->power_sleeping;
+        mutexUnlock(&state->lock);
+        if (power_sleeping) {
+            bool flushed = mqtt_publish_sleep(state,fd,&config);
+            app_state_push_log(state,"Sleep state %s",flushed?"acknowledged by broker":"flush not confirmed");
+        } else {
+            publish_state(state, fd, &config, "offline");
+        }
         close(fd);
         g_ctx.socket_fd = -1;
         mutexLock(&state->lock);
