@@ -3,6 +3,14 @@
 This changelog documents the original Switch Assistant releases
 and the additional changes introduced in the manuelgzz fork.
 
+## [v2.0.1] - Home Assistant controls and telemetry
+
+- Integrates FaserF sensors for system telemetry, controllers, storage and multiplayer games.
+- Adds sleep, close-game, Daybreak, diagnostics, screen, brightness and volume controls.
+- Adds installed-game selectors, overlay events and firmware version reporting.
+- Preserves Operation Mode and SD storage entities, and keeps RTSP opt-in.
+- The Daybreak command preserves existing firmware files on the SD card.
+
 ## [v1.12.0] - Opt-in RTSP Control
 
 ### Changed
