@@ -4,8 +4,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "mqtt/mqtt_state.h"
-
 void app_state_init(AppState *state) {
     memset(state, 0, sizeof(*state));
     mutexInit(&state->lock);
@@ -14,59 +12,6 @@ void app_state_init(AppState *state) {
     snprintf(state->config_status, sizeof(state->config_status), "not loaded");
     snprintf(state->mqtt_last_error, sizeof(state->mqtt_last_error), "not connected");
     snprintf(state->game_status, sizeof(state->game_status), "not checked");
-}
-
-void app_state_refresh_device_info(AppState *state) {
-    if (!state) return;
-
-    mutexLock(&state->lock);
-
-    // Invalidate cached AMS version if it accidentally matched the firmware version
-    if (state->cached_firmware_ver[0] != '\0' &&
-        strcmp(state->cached_atmosphere_ver, state->cached_firmware_ver) == 0) {
-        state->cached_atmosphere_ver[0] = '\0';
-    }
-
-    // Always refresh firmware/AMS versions if either is missing or unknown
-    if (state->cached_firmware_ver[0] == '\0' || strcmp(state->cached_firmware_ver, "Unknown") == 0 ||
-        state->cached_atmosphere_ver[0] == '\0' || strcmp(state->cached_atmosphere_ver, "Unknown") == 0) {
-        mqtt_get_system_versions(state, state->cached_firmware_ver, sizeof(state->cached_firmware_ver),
-                                 state->cached_atmosphere_ver, sizeof(state->cached_atmosphere_ver));
-    }
-
-    // Use configured MAC address if present, otherwise derive from serial number
-    if (state->cached_mac[0] == '\0') {
-        if (state->config.mac_address[0] != '\0') {
-            snprintf(state->cached_mac, sizeof(state->cached_mac), "%s", state->config.mac_address);
-        } else {
-            bool setsys_local = false;
-            if (!state->svc_setsys_ready) {
-                if (R_SUCCEEDED(setsysInitialize())) {
-                    setsys_local = true;
-                    state->svc_setsys_ready = true;
-                }
-            }
-            if (state->svc_setsys_ready) {
-                SetSysSerialNumber serial = {0};
-                if (R_SUCCEEDED(setsysGetSerialNumber(&serial)) && serial.number[0] != '\0') {
-                    // Derive a stable 6-byte identifier from serial number chars
-                    // Format: XX:XX:XX:XX:XX:XX using first 6 bytes of serial
-                    unsigned char b[6] = {0};
-                    for (int i = 0; i < 6 && serial.number[i] != '\0'; i++) {
-                        b[i] = (unsigned char)serial.number[i];
-                    }
-                    snprintf(state->cached_mac, sizeof(state->cached_mac),
-                             "%02x:%02x:%02x:%02x:%02x:%02x",
-                             b[0], b[1], b[2], b[3], b[4], b[5]);
-                }
-            }
-            if (setsys_local && !state->svc_setsys_ready) {
-                setsysExit();
-            }
-        }
-    }
-
-    mutexUnlock(&state->lock);
 }
 
 static void write_line(char *dst, size_t dst_size, const char *fmt, va_list args) {

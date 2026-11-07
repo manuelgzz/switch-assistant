@@ -1,7 +1,6 @@
 #include "app_state.h"
 #include "config.h"
 #include "http_client.h"
-#include "logger.h"
 #include "mqtt_client.h"
 #include "title_cache.h"
 #include "ui.h"
@@ -246,8 +245,6 @@ int main(int argc, char **argv) {
 
     AppState state;
     app_state_init(&state);
-    logger_init(&state, "sdmc:/switch/switch-ha/switch-ha-app.log");
-    LOG_I("app", "Switch Assistant App started (version %s)", SHA_APP_BUILD);
 
     if (config_load(&state.config)) {
         app_state_push_log(&state, "Config loaded");
@@ -268,7 +265,6 @@ int main(int argc, char **argv) {
     }
 
     install_sysmodule(&state);
-    app_state_refresh_device_info(&state);
 
     app_state_push_log(&state, "Initial connection test");
     app_state_set_status(&state, "Testing HA and MQTT...");
