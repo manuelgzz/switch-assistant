@@ -1,5 +1,10 @@
 # Nuevos controles e integración MQTT
 
+La versión publicada **v1.12.1** consolida el estado de **1.12.1-fix6**.
+Los apartados fix1–fix6 documentan el desarrollo anterior; para el comportamiento
+vigente de suspensión se aplica fix6. No se vuelven a habilitar Sleep, Close Game
+ni el interruptor RTSP de Home Assistant.
+
 Esta primera integración toma como referencia las funciones de FaserF/switch-assistant,
 revisadas frente a las API disponibles en nuestro devkitPro. Daybreak no se incluye.
 La compilación y las pruebas de protocolo/discovery se pueden validar en Linux;

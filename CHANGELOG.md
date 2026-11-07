@@ -3,6 +3,39 @@
 This changelog documents the original Switch Assistant releases
 and the additional changes introduced in the manuelgzz fork.
 
+## [v1.12.1] - Home Assistant Controls and Retained Telemetry
+
+### Added
+- Per-console MQTT command topics, brightness/backlight controls, volume controls,
+  native mute with fallback, diagnostics and additional system/controller sensors.
+- Direct running-application detection with Title ID and diagnostic reporting.
+- Four configurable overlay quick actions published as Home Assistant events.
+- Branch builds and downloadable GitHub Actions artifacts, using a pinned devkitPro image.
+- Host regression tests for MQTT framing/discovery/commands, audio, game lookup,
+  runtime firmware initialization, and title-index byte offsets.
+
+### Fixed
+- Initialize the Horizon firmware version before version-dependent service calls.
+- Regenerate the title index from the exact catalog bytes, preserving line endings
+  and recovering names from a stale installed index.
+- Retain the last sensor readings across suspension and MQTT disconnections.
+- Keep audio readback and controls on the same supported service route and use
+  hardware-sized volume steps.
+
+### Current Limitations
+- Sleep is inferred from MQTT disconnection, which can take about 45 seconds;
+  a network outage can also display Sleep. `Power state source` exposes this origin.
+- Remote Sleep, forced Close Game and the Home Assistant RTSP toggle are removed.
+- PSC power-management registration is removed following the reported suspend failure.
+- Background game launching, Daybreak and automatic firmware/Atmosphere updates
+  are not included in this release.
+
+### Installation
+- Replace `sdmc:/switch/switch-ha/switch-ha.nro`, open Switch Assistant to install
+  the embedded components and title catalog, then fully reboot the console.
+- Manual MQTT automations must use `switch_ha/<client_id>/command` instead of
+  the former shared discovery-prefix command topic.
+
 ## [v1.12.0] - Opt-in RTSP Control
 
 ### Changed
