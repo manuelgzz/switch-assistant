@@ -1,6 +1,7 @@
 #include "app_state.h"
 #include "title_cache.h"
 #include "config.h"
+#include "logger.h"
 #include "mqtt_client.h"
 #include "screen_stream.h"
 
@@ -16,15 +17,18 @@
 #define RESULT_OPTIONAL_TIMEOUT MAKERESULT(Module_Libnx, LibnxError_Timeout)
 #define RESULT_NOT_INITIALIZED MAKERESULT(Module_Libnx, LibnxError_NotInitialized)
 
-static Result g_ts_init_result = RESULT_NOT_INITIALIZED;
-static Result g_nifm_init_result = RESULT_NOT_INITIALIZED;
 static Result g_socket_init_result = RESULT_NOT_INITIALIZED;
 static Result g_psm_init_result = RESULT_NOT_INITIALIZED;
 static Result g_spsm_init_result = RESULT_NOT_INITIALIZED;
+static Result g_spl_init_result = RESULT_NOT_INITIALIZED;
 static Result g_hid_init_result = RESULT_NOT_INITIALIZED;
 static Result g_lbl_init_result = RESULT_NOT_INITIALIZED;
 static Result g_audctl_init_result = RESULT_NOT_INITIALIZED;
 static Result g_pminfo_init_result = RESULT_NOT_INITIALIZED;
+static Result g_setsys_init_result = RESULT_NOT_INITIALIZED;
+static Service g_omm_service;
+static Result g_ts_init_result = RESULT_NOT_INITIALIZED;
+static Result g_nifm_init_result = RESULT_NOT_INITIALIZED;
 static Thread g_power_guard_thread = {0};
 static bool g_power_guard_thread_active = false;
 
@@ -51,8 +55,6 @@ void __appInit(void) {
         diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
     }
     fsdevMountSdmc();
-
-    smExit();
 }
 
 void __appExit(void) {
@@ -60,47 +62,30 @@ void __appExit(void) {
         threadClose(&g_power_guard_thread);
         g_power_guard_thread_active = false;
     }
+    if (R_SUCCEEDED(g_nifm_init_result)) nifmExit();
+    serviceClose(&g_omm_service);
+    if (R_SUCCEEDED(g_ts_init_result)) tsExit();
+    if (R_SUCCEEDED(g_setsys_init_result)) setsysExit();
     if (R_SUCCEEDED(g_pminfo_init_result)) pminfoExit();
     if (R_SUCCEEDED(g_audctl_init_result)) audctlExit();
     if (R_SUCCEEDED(g_lbl_init_result)) lblExit();
     if (R_SUCCEEDED(g_hid_init_result)) hidExit();
     screen_stream_stop();
+    if (R_SUCCEEDED(g_spl_init_result)) splExit();
     if (R_SUCCEEDED(g_spsm_init_result)) spsmExit();
     if (R_SUCCEEDED(g_psm_init_result)) psmExit();
-    if (R_SUCCEEDED(g_ts_init_result)) tsExit();
-    if (R_SUCCEEDED(g_nifm_init_result)) nifmExit();
     if (R_SUCCEEDED(g_socket_init_result)) socketExit();
     fsdevUnmountAll();
     fsExit();
+    smExit();
 }
 
 static u64 monotonic_ms(void) {
     return armTicksToNs(armGetSystemTick()) / 1000000ULL;
 }
 
-static void append_log(const char *message) {
-    FILE *file = fopen(LOG_PATH, "a");
-    if (!file) {
-        return;
-    }
-    fprintf(file, "%lu %s\n", monotonic_ms(), message);
-    fclose(file);
-}
-
-static void append_log_result(const char *name, Result rc) {
-    char line[96];
-    snprintf(line, sizeof(line), "%s=0x%x", name, rc);
-    append_log(line);
-}
-
 static void init_core_services(AppState *state) {
-    append_log("core service init start");
-
-    Result rc = smInitialize();
-    if (R_FAILED(rc)) {
-        append_log_result("sm_init", rc);
-        return;
-    }
+    LOG_I("sys", "Core service init started");
 
     SocketInitConfig socket_config = {
         .tcp_tx_buf_size = 0x8000,
@@ -114,92 +99,60 @@ static void init_core_services(AppState *state) {
         .bsd_service_type = BsdServiceType_System,
     };
     g_socket_init_result = socketInitialize(&socket_config);
-    append_log_result("socket_init", g_socket_init_result);
+    LOG_I("sys", "socketInitialize rc=0x%x", g_socket_init_result);
 
     g_psm_init_result = psmInitialize();
-    append_log_result("psm_init", g_psm_init_result);
+    LOG_I("sys", "psmInitialize rc=0x%x", g_psm_init_result);
 
     g_spsm_init_result = spsmInitialize();
     state->svc_spsm_ready = R_SUCCEEDED(g_spsm_init_result);
-    append_log_result("spsm_init", g_spsm_init_result);
+    LOG_I("sys", "spsmInitialize rc=0x%x", g_spsm_init_result);
 
-    smExit();
-    append_log("core service init done");
+    g_spl_init_result = splInitialize();
+    state->svc_spl_ready = R_SUCCEEDED(g_spl_init_result);
+    LOG_I("sys", "splInitialize rc=0x%x", g_spl_init_result);
+
+    LOG_I("sys", "Core service init completed");
 }
 
-static void power_guard_thread_main(void* arg) {
-    AppState* state = arg;
+static void power_guard_thread_main(void *arg) {
+    AppState *state = arg;
     bool last_sleeping = false;
-    bool last_screen_off = false;
-    bool system_was_active_in_dock = false;
-
-    LblBacklightSwitchStatus backlight;
-    Result rc;
-    bool screen_off;
-    bool is_docked_by_state;
-    bool sleeping;
 
     while (true) {
-        if (!state->svc_lbl_ready) {
-            svcSleepThread(1000ULL * 1000ULL * 1000ULL);
-            continue;
+        // In sysmodule mode, appletGetOperationMode() is not available / returns 0.
+        // Screen backlight turning off or dimming must NOT mark the system as sleeping!
+        // When power_sleeping was set to true, MQTT heartbeats stopped and HA marked
+        // all entities as unavailable.
+        // We only use backlight status to pause RTSP screen streaming if screen is off in handheld.
+        bool screen_off = false;
+        if (state->svc_lbl_ready) {
+            LblBacklightSwitchStatus backlight = LblBacklightSwitchStatus_Enabled;
+            if (R_SUCCEEDED(lblGetBacklightSwitchStatus(&backlight))) {
+                screen_off = (backlight == LblBacklightSwitchStatus_Disabled ||
+                              backlight == LblBacklightSwitchStatus_Disabling);
+            }
         }
 
-        backlight = LblBacklightSwitchStatus_Enabled;
-        rc = lblGetBacklightSwitchStatus(&backlight);
-        if (R_FAILED(rc)) {
-            svcSleepThread(250ULL * 1000ULL * 1000ULL);
-            continue;
-        }
-
-        screen_off = (backlight == LblBacklightSwitchStatus_Disabled ||
-            backlight == LblBacklightSwitchStatus_Disabling);
-
-        if (screen_off != last_screen_off) {
+        if (screen_off != last_sleeping) {
             screen_stream_set_paused(screen_off);
-            last_screen_off = screen_off;
+            last_sleeping = screen_off;
         }
 
-        is_docked_by_state = screen_off && !state->power_sleeping;
-        sleeping = screen_off && !is_docked_by_state;
-
-        if (screen_off && is_docked_by_state) {
-            system_was_active_in_dock = true;
-        }
-
-        if (sleeping && system_was_active_in_dock) {
-            mutexLock(&state->lock);
-            state->power_sleeping = true;
-            state->sensor_publish_requested = true;
-            mutexUnlock(&state->lock);
-
-            svcSleepThread(150ULL * 1000ULL * 1000ULL);
-            system_was_active_in_dock = false;
-        }
-
-        if (sleeping != last_sleeping) {
-            mutexLock(&state->lock);
-            state->power_sleeping = sleeping;
-            state->sensor_publish_requested = true;
-            mutexUnlock(&state->lock);
-            last_sleeping = sleeping;
-        }
-
-        svcSleepThread(sleeping ? 2000ULL * 1000ULL * 1000ULL : 1000ULL * 100ULL * 100ULL);
+        svcSleepThread(1000ULL * 1000ULL * 1000ULL);
     }
 }
-
 
 static void init_power_guard(AppState *state) {
     Result rc = threadCreate(&g_power_guard_thread, power_guard_thread_main, state, NULL, 0x4000, 0x2B, -2);
     if (R_FAILED(rc)) {
-        append_log_result("power_guard_create", rc);
+        LOG_E("sys", "threadCreate power_guard failed rc=0x%x", rc);
         return;
     }
     g_power_guard_thread_active = true;
     rc = threadStart(&g_power_guard_thread);
     if (R_FAILED(rc)) {
-        append_log_result("power_guard_start", rc);
+        LOG_E("sys", "threadStart power_guard failed rc=0x%x", rc);
         threadClose(&g_power_guard_thread);
         g_power_guard_thread_active = false;
     }
@@ -210,11 +163,9 @@ static void apply_startup_delay(const AppConfig *config) {
         return;
     }
 
-    char line[96];
-    snprintf(line, sizeof(line), "startup delay %d sec", config->startup_delay_seconds);
-    append_log(line);
+    LOG_I("sys", "Startup delay %d seconds starting", config->startup_delay_seconds);
     svcSleepThread((u64) config->startup_delay_seconds * 1000ULL * 1000ULL * 1000ULL);
-    append_log("startup delay done");
+    LOG_I("sys", "Startup delay completed");
 }
 
 typedef enum {
@@ -222,8 +173,11 @@ typedef enum {
     OptionalService_Lbl,
     OptionalService_Audctl,
     OptionalService_Pminfo,
+    OptionalService_Setsys,
+    OptionalService_Spl,
     OptionalService_Ts,
     OptionalService_Nifm,
+    OptionalService_Omm,
 } OptionalService;
 
 typedef struct {
@@ -234,45 +188,48 @@ typedef struct {
 
 static void optional_init_thread(void *arg) {
     OptionalInitTask *task = arg;
-    Result rc = smInitialize();
-    if (R_SUCCEEDED(rc)) {
-        switch (task->service) {
-            case OptionalService_Hid:
-                rc = hidInitialize();
-                break;
-            case OptionalService_Lbl:
-                rc = lblInitialize();
-                break;
-            case OptionalService_Audctl:
-                rc = audctlInitialize();
-                break;
-            case OptionalService_Pminfo:
-                rc = pminfoInitialize();
-                break;
-            case OptionalService_Ts:
-                if (hosversionGet() == 0 && R_SUCCEEDED(setsysInitialize())) {
-                    SetSysFirmwareVersion firmware;
-                    if (R_SUCCEEDED(setsysGetFirmwareVersion(&firmware))) {
-                        hosversionSet(MAKEHOSVERSION(firmware.major, firmware.minor, firmware.micro));
-                    }
-                    setsysExit();
+    Result rc = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    switch (task->service) {
+        case OptionalService_Hid:
+            rc = hidInitialize();
+            break;
+        case OptionalService_Lbl:
+            rc = lblInitialize();
+            break;
+        case OptionalService_Audctl:
+            rc = audctlInitialize();
+            break;
+        case OptionalService_Pminfo:
+            rc = pminfoInitialize();
+            break;
+        case OptionalService_Setsys:
+            rc = setsysInitialize();
+            if (R_SUCCEEDED(rc) && hosversionGet() == 0) {
+                SetSysFirmwareVersion firmware;
+                if (R_SUCCEEDED(setsysGetFirmwareVersion(&firmware))) {
+                    hosversionSet(MAKEHOSVERSION(firmware.major, firmware.minor, firmware.micro));
                 }
-                rc = tsInitialize();
-                break;
-            case OptionalService_Nifm:
-                rc = nifmInitialize(NifmServiceType_System);
-                break;
-        }
-        smExit();
+            }
+            break;
+        case OptionalService_Spl:
+            rc = splInitialize();
+            break;
+        case OptionalService_Ts:
+            rc = tsInitialize();
+            break;
+        case OptionalService_Omm:
+            rc = smGetService(&g_omm_service, "omm");
+            break;
+        case OptionalService_Nifm:
+            rc = nifmInitialize(NifmServiceType_System);
+            break;
     }
     task->rc = rc;
     task->done = true;
 }
 
 static Result init_service_with_timeout(const char *label, OptionalService service) {
-    char line[96];
-    snprintf(line, sizeof(line), "starting %s", label);
-    append_log(line);
+    LOG_D("sys", "Starting service init: %s", label);
 
     OptionalInitTask *task = calloc(1, sizeof(*task));
     if (!task) {
@@ -312,36 +269,45 @@ static Result init_service_with_timeout(const char *label, OptionalService servi
         return init_rc;
     }
 
-    snprintf(line, sizeof(line), "%s init timed out", label);
-    append_log(line);
+    LOG_W("sys", "Service %s init timed out", label);
     return RESULT_OPTIONAL_TIMEOUT;
 }
 
 static void init_optional_services(AppState *state) {
-    append_log("optional service init start");
+    LOG_I("sys", "Optional service init start");
 
     g_hid_init_result = init_service_with_timeout("hid", OptionalService_Hid);
     state->svc_hid_ready = R_SUCCEEDED(g_hid_init_result);
-    append_log_result("hid_init", g_hid_init_result);
+    LOG_I("sys", "hid_init rc=0x%x", g_hid_init_result);
 
     g_lbl_init_result = init_service_with_timeout("lbl", OptionalService_Lbl);
     state->svc_lbl_ready = R_SUCCEEDED(g_lbl_init_result);
-    append_log_result("lbl_init", g_lbl_init_result);
+    LOG_I("sys", "lbl_init rc=0x%x", g_lbl_init_result);
 
     g_audctl_init_result = init_service_with_timeout("audctl", OptionalService_Audctl);
     state->svc_audctl_ready = R_SUCCEEDED(g_audctl_init_result);
-    append_log_result("audctl_init", g_audctl_init_result);
+    LOG_I("sys", "audctl_init rc=0x%x", g_audctl_init_result);
 
     g_pminfo_init_result = init_service_with_timeout("pminfo", OptionalService_Pminfo);
     state->svc_pminfo_ready = R_SUCCEEDED(g_pminfo_init_result);
-    append_log_result("pminfo_init", g_pminfo_init_result);
+    LOG_I("sys", "pminfo_init rc=0x%x", g_pminfo_init_result);
+
+    g_setsys_init_result = init_service_with_timeout("setsys", OptionalService_Setsys);
+    state->svc_setsys_ready = R_SUCCEEDED(g_setsys_init_result);
+    LOG_I("sys", "setsys_init rc=0x%x", g_setsys_init_result);
 
     g_ts_init_result = init_service_with_timeout("ts", OptionalService_Ts);
     state->svc_ts_ready = R_SUCCEEDED(g_ts_init_result);
+    LOG_I("sys", "ts_init rc=0x%x", g_ts_init_result);
+
     g_nifm_init_result = init_service_with_timeout("nifm", OptionalService_Nifm);
     state->svc_nifm_ready = R_SUCCEEDED(g_nifm_init_result);
+    LOG_I("sys", "nifm_init rc=0x%x", g_nifm_init_result);
 
-    append_log("optional service init done");
+    if (R_SUCCEEDED(init_service_with_timeout("omm", OptionalService_Omm))) {
+        state->omm_service = &g_omm_service;
+    }
+    LOG_I("sys", "Optional service init completed");
 }
 
 static void write_heartbeat(AppState *state) {
@@ -377,61 +343,41 @@ static void write_heartbeat(AppState *state) {
     fprintf(file, "lbl_init=0x%x\n", g_lbl_init_result);
     fprintf(file, "audctl_init=0x%x\n", g_audctl_init_result);
     fprintf(file, "pminfo_init=0x%x\n", g_pminfo_init_result);
+    fprintf(file, "setsys_init=0x%x\n", g_setsys_init_result);
+    fprintf(file, "ts_init=0x%x\n", g_ts_init_result);
+    fprintf(file, "nifm_init=0x%x\n", g_nifm_init_result);
     mutexUnlock(&state->lock);
 
     fclose(file);
-}
-
-static Thread g_game_inventory_thread;
-
-static void load_game_inventory(void *arg) {
-    AppState *state = arg;
-    if (R_FAILED(smInitialize())) return;
-    bool ready = title_cache_refresh_installed_games();
-    smExit();
-
-    mutexLock(&state->lock);
-    state->game_inventory_ready = ready;
-    mutexUnlock(&state->lock);
-    append_log(ready ? "Game inventory loaded" : "Game inventory unavailable");
 }
 
 int main(int argc, char **argv) {
     AppState state;
     app_state_init(&state);
     state.app_mode = AppMode_Sysmodule;
-    append_log("sysmodule boot");
+    logger_init(&state, LOG_PATH);
+    LOG_I("sys", "Switch Assistant Sysmodule Boot (Version %s)", SHA_APP_BUILD);
 
     if (!config_load(&state.config)) {
         snprintf(state.config_status, sizeof(state.config_status), "no config");
         app_state_push_log(&state, "No config, waiting");
-        append_log("config missing");
+        LOG_W("config", "Config file missing or invalid");
     } else {
         snprintf(state.config_status, sizeof(state.config_status), "loaded");
         app_state_push_log(&state, "Config loaded");
-        append_log("config loaded");
+        LOG_I("config", "Config loaded successfully");
     }
 
     apply_startup_delay(&state.config);
     init_core_services(&state);
     init_optional_services(&state);
-    if (state.config.rtsp_enabled) {
-        screen_stream_start(&state);
-        append_log("rtsp enabled");
-    } else {
-        append_log("rtsp disabled");
-    }
+    app_state_refresh_device_info(&state);
+    if (state.config.rtsp_enabled) screen_stream_start(&state);
     init_power_guard(&state);
 
+    title_cache_init();
     mqtt_service_start(&state);
-    Result inventory_rc = threadCreate(&g_game_inventory_thread, load_game_inventory,
-                                       &state, NULL, 0x8000, 0x2C, -2);
-    if (R_SUCCEEDED(inventory_rc)) {
-        inventory_rc = threadStart(&g_game_inventory_thread);
-        if (R_FAILED(inventory_rc)) threadClose(&g_game_inventory_thread);
-    }
-    append_log_result("game_inventory_thread", inventory_rc);
-    append_log("mqtt thread started");
+    LOG_I("mqtt", "MQTT worker thread launched");
 
     while (true) {
         AppConfig loaded;

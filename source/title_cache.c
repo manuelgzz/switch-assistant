@@ -1,7 +1,11 @@
 #include "title_cache.h"
+#include "logger.h"
 
+#include <switch.h>
 #include <switch/services/ns.h>
 #include <switch/nacp.h>
+#include <switch/services/applet.h>
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +23,10 @@ static bool g_title_index_loaded;
 static u64 g_cached_application_id;
 static char g_cached_name[0x200];
 
+static InstalledGame g_installed_games[MAX_INSTALLED_GAMES];
+static size_t g_installed_game_count = 0;
+static bool g_inventory_loaded;
+
 static void trim_line(char *value) {
     while (value[0] == ' ' || value[0] == '\t' || value[0] == '\r' || value[0] == '\n') {
         memmove(value, value + 1, strlen(value));
@@ -34,14 +42,34 @@ static void trim_line(char *value) {
     }
 }
 
+static const char *case_str_search(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (needle[0] == '\0') return haystack;
+    size_t needle_len = strlen(needle);
+    for (size_t i = 0; haystack[i]; ++i) {
+        if (strncasecmp(haystack + i, needle, needle_len) == 0) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
 static bool parse_title_id(const char *value, u64 *application_id) {
+    if (!value || value[0] == '\0') {
+        return false;
+    }
+
+    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+        value++;
+    }
+
     if (strncasecmp(value, "0x", 2) == 0) {
         value += 2;
     }
 
     char *end = NULL;
     unsigned long long parsed = strtoull(value, &end, 16);
-    if (!end || *end != '\0' || parsed == 0) {
+    if (!end || (*end != '\0' && *end != ' ' && *end != '\t' && *end != '\r' && *end != '\n') || parsed == 0) {
         return false;
     }
 
@@ -59,6 +87,12 @@ static int compare_title_entries(const void *lhs, const void *rhs) {
         return 1;
     }
     return 0;
+}
+
+static int compare_installed_games(const void *lhs, const void *rhs) {
+    const InstalledGame *a = (const InstalledGame *) lhs;
+    const InstalledGame *b = (const InstalledGame *) rhs;
+    return strcasecmp(a->name, b->name);
 }
 
 static void title_index_load(void) {
@@ -172,31 +206,24 @@ bool title_cache_lookup(u64 application_id, char *out, size_t out_size) {
     return read_title_name_at_offset(entry->offset, out, out_size) && g_cached_application_id == application_id;
 }
 
-/* Multiplayer metadata and installed-title enumeration adapted from FaserF/switch-assistant. */
-#define MAX_INSTALLED_GAMES 256
-
-typedef struct {
-    u64 application_id;
-    char name[128];
-    int max_players;
-} InstalledGame;
-
-static InstalledGame g_installed_games[MAX_INSTALLED_GAMES];
-static size_t g_installed_game_count;
-
-static const char *case_str_search(const char *haystack, const char *needle) {
-    if (!haystack || !needle) return NULL;
-    if (needle[0] == '\0') return haystack;
-    size_t needle_len = strlen(needle);
-    for (size_t i = 0; haystack[i]; ++i) {
-        if (strncasecmp(haystack + i, needle, needle_len) == 0) {
-            return haystack + i;
-        }
-    }
-    return NULL;
+void title_cache_init(void) {
+    title_index_load();
+    title_cache_refresh_installed_games();
 }
 
-static int title_cache_get_max_players(u64 application_id, const char *name) {
+size_t title_cache_get_installed_games(InstalledGame *out_games, size_t max_games) {
+    if (!g_inventory_loaded) {
+        title_cache_refresh_installed_games();
+    }
+    if (out_games && max_games > 0) {
+        size_t copy_count = g_installed_game_count < max_games ? g_installed_game_count : max_games;
+        memcpy(out_games, g_installed_games, copy_count * sizeof(InstalledGame));
+        return copy_count;
+    }
+    return g_installed_game_count;
+}
+
+int title_cache_get_max_players(u64 application_id, const char *name) {
     FILE *override = fopen("sdmc:/switch/switch-ha/players.ini", "r");
     if (!override) {
         override = fopen("sdmc:/switch/switch-ha/players.txt", "r");
@@ -207,7 +234,7 @@ static int title_cache_get_max_players(u64 application_id, const char *name) {
             trim_line(line);
             char *sep = strchr(line, '=');
             if (!sep) sep = strchr(line, ';');
-            if (!sep || sep == line) continue;
+            if (!sep) continue;
             *sep = '\0';
             const char *key = line;
             const char *val = sep + 1;
@@ -317,84 +344,87 @@ static int title_cache_get_max_players(u64 application_id, const char *name) {
     return 1;
 }
 
-bool title_cache_refresh_installed_games(void) {
-    g_installed_game_count = 0;
+size_t title_cache_refresh_installed_games(void) {
+    g_inventory_loaded = true;
+    title_index_load();
+
     size_t found = 0;
     Result rc = nsInitialize();
-    if (R_FAILED(rc)) return false;
-    bool complete = true;
-    s32 offset = 0;
-    NsApplicationRecord records[32];
-    s32 out_count = 0;
+    if (R_SUCCEEDED(rc)) {
+        s32 offset = 0;
+        NsApplicationRecord records[32];
+        s32 out_count = 0;
 
-    NsApplicationControlData *ctrl_data = malloc(sizeof(NsApplicationControlData));
+        NsApplicationControlData *ctrl_data = malloc(sizeof(NsApplicationControlData));
 
-    while (found < MAX_INSTALLED_GAMES) {
-        s32 fetch_count = (MAX_INSTALLED_GAMES - found > 32) ? 32 : (s32)(MAX_INSTALLED_GAMES - found);
-        Result list_rc = nsListApplicationRecord(records, fetch_count, offset, &out_count);
-        if (R_FAILED(list_rc)) {
-            complete = false;
-            break;
-        }
-        if (out_count <= 0) break;
-
-        for (s32 i = 0; i < out_count && found < MAX_INSTALLED_GAMES; ++i) {
-            u64 app_id = records[i].application_id;
-            if (app_id == 0) {
-                continue;
+        while (found < MAX_INSTALLED_GAMES) {
+            s32 fetch_count = (MAX_INSTALLED_GAMES - found > 32) ? 32 : (s32)(MAX_INSTALLED_GAMES - found);
+            Result list_rc = nsListApplicationRecord(records, fetch_count, offset, &out_count);
+            if (R_FAILED(list_rc) || out_count <= 0) {
+                break;
             }
 
-            char name[128] = "";
-            if (ctrl_data) {
-                u64 actual_size = 0;
-                if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, app_id, ctrl_data, sizeof(*ctrl_data), &actual_size))) {
-                    NacpLanguageEntry *lang_entry = NULL;
-                    if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl_data->nacp, &lang_entry)) && lang_entry && lang_entry->name[0] != '\0') {
-                        size_t lang_name_len = strnlen(lang_entry->name, sizeof(name) - 1);
-                        while (lang_name_len > 0 && ((unsigned char)lang_entry->name[lang_name_len] & 0xc0) == 0x80) {
-                            --lang_name_len;
+            for (s32 i = 0; i < out_count && found < MAX_INSTALLED_GAMES; ++i) {
+                u64 app_id = records[i].application_id;
+                if (app_id == 0) {
+                    continue;
+                }
+
+                char name[128] = "";
+                if (!title_cache_lookup(app_id, name, sizeof(name))) {
+                    if (ctrl_data) {
+                        size_t actual_size = 0;
+                        if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, app_id, ctrl_data, sizeof(*ctrl_data), &actual_size))) {
+                            NacpLanguageEntry *lang_entry = NULL;
+                            if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl_data->nacp, &lang_entry)) && lang_entry && lang_entry->name[0] != '\0') {
+                                size_t lang_name_len = strnlen(lang_entry->name, sizeof(name) - 1);
+                                memcpy(name, lang_entry->name, lang_name_len);
+                                name[lang_name_len] = '\0';
+                            }
                         }
-                        memcpy(name, lang_entry->name, lang_name_len);
-                        name[lang_name_len] = '\0';
                     }
                 }
-            }
 
-            if (name[0] == '\0') {
-                snprintf(name, sizeof(name), "0x%016llX", (unsigned long long) app_id);
-            }
-            trim_line(name);
+                if (name[0] == '\0') {
+                    snprintf(name, sizeof(name), "0x%016llX", (unsigned long long) app_id);
+                }
+                trim_line(name);
 
-            // Avoid duplicates
-            bool dup = false;
-            for (size_t d = 0; d < found; ++d) {
-                if (g_installed_games[d].application_id == app_id) {
-                    dup = true;
-                    break;
+                // Avoid duplicates
+                bool dup = false;
+                for (size_t d = 0; d < found; ++d) {
+                    if (g_installed_games[d].application_id == app_id) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    g_installed_games[found].application_id = app_id;
+                    size_t name_len = strlen(name);
+                    if (name_len >= sizeof(g_installed_games[found].name)) {
+                        name_len = sizeof(g_installed_games[found].name) - 1;
+                    }
+                    memcpy(g_installed_games[found].name, name, name_len);
+                    g_installed_games[found].name[name_len] = '\0';
+                    g_installed_games[found].max_players = title_cache_get_max_players(app_id, name);
+                    found++;
                 }
             }
-            if (!dup) {
-                g_installed_games[found].application_id = app_id;
-                size_t name_len = strlen(name);
-                if (name_len >= sizeof(g_installed_games[found].name)) {
-                    name_len = sizeof(g_installed_games[found].name) - 1;
-                }
-                memcpy(g_installed_games[found].name, name, name_len);
-                g_installed_games[found].name[name_len] = '\0';
-                g_installed_games[found].max_players = title_cache_get_max_players(app_id, name);
-                found++;
-            }
+            offset += out_count;
         }
-        offset += out_count;
+
+        if (ctrl_data) {
+            free(ctrl_data);
+        }
+        nsExit();
     }
 
-    if (ctrl_data) {
-        free(ctrl_data);
+    g_installed_game_count = found;
+    if (found > 0) {
+        qsort(g_installed_games, found, sizeof(InstalledGame), compare_installed_games);
     }
-    nsExit();
 
-    if (complete) g_installed_game_count = found;
-    return complete;
+    return g_installed_game_count;
 }
 
 static void append_json_escaped_string(char *dst, size_t dst_size, size_t *pos, const char *src) {
@@ -419,26 +449,255 @@ static void append_json_escaped_string(char *dst, size_t dst_size, size_t *pos, 
     }
 }
 
+void title_cache_build_json_options_array_for_players(char *out, size_t out_size, int min_players) {
+    if (!out || out_size < 3) {
+        if (out && out_size > 0) out[0] = '\0';
+        return;
+    }
 
-size_t title_cache_build_games_attr(char *out, size_t out_size, int min_players) {
+    if (!g_inventory_loaded) {
+        title_cache_refresh_installed_games();
+    }
+
     size_t pos = 0;
-    size_t count = 0;
-    size_t written = 0;
-    for (size_t i = 0; i < g_installed_game_count; ++i) {
-        if (g_installed_games[i].max_players >= min_players) ++count;
+    out[pos++] = '[';
+
+    append_json_escaped_string(out, out_size, &pos, "Home Menu");
+
+    for (size_t i = 0; i < g_installed_game_count && pos + 4 < out_size; ++i) {
+        if (g_installed_games[i].name[0] == '\0') {
+            continue;
+        }
+        if (min_players > 1 && g_installed_games[i].max_players < min_players) {
+            continue;
+        }
+        if (pos + 1 < out_size) {
+            out[pos++] = ',';
+        }
+        append_json_escaped_string(out, out_size, &pos, g_installed_games[i].name);
     }
 
-    int prefix_len = snprintf(out, out_size, "{\"count\":%zu,\"min_players\":%d,\"games\":[",
-                              count, min_players);
-    if (prefix_len < 0 || (size_t)prefix_len + 3 > out_size) return count;
-    pos = (size_t)prefix_len;
-    for (size_t i = 0; i < g_installed_game_count; ++i) {
-        const InstalledGame *game = &g_installed_games[i];
-        if (game->max_players < min_players) continue;
-        if (out_size - pos < 2 * strlen(game->name) + 8) continue;
-        if (written++ > 0) out[pos++] = ',';
-        append_json_escaped_string(out, out_size, &pos, game->name);
+    if (pos + 1 < out_size) {
+        out[pos++] = ']';
+    } else {
+        out[out_size - 2] = ']';
+        pos = out_size - 1;
     }
-    memcpy(out + pos, "]}", 3);
+    out[pos] = '\0';
+}
+
+void title_cache_build_json_options_array(char *out, size_t out_size) {
+    title_cache_build_json_options_array_for_players(out, out_size, 1);
+}
+
+static void title_cache_build_json_games_list_for_attr(char *out, size_t out_size, int min_players) {
+    if (!out || out_size < 3) {
+        if (out && out_size > 0) out[0] = '\0';
+        return;
+    }
+
+    if (!g_inventory_loaded) {
+        title_cache_refresh_installed_games();
+    }
+
+    size_t pos = 0;
+    out[pos++] = '[';
+
+    bool first = true;
+    for (size_t i = 0; i < g_installed_game_count && pos + 4 < out_size; ++i) {
+        if (g_installed_games[i].name[0] == '\0') {
+            continue;
+        }
+        if (min_players > 1 && g_installed_games[i].max_players < min_players) {
+            continue;
+        }
+        if (!first && pos + 1 < out_size) {
+            out[pos++] = ',';
+        }
+        first = false;
+        append_json_escaped_string(out, out_size, &pos, g_installed_games[i].name);
+    }
+
+    if (pos + 1 < out_size) {
+        out[pos++] = ']';
+    } else {
+        out[out_size - 2] = ']';
+        pos = out_size - 1;
+    }
+    out[pos] = '\0';
+}
+
+size_t title_cache_get_games_by_min_players(InstalledGame *out_games, size_t max_games, int min_players) {
+    if (!g_inventory_loaded) {
+        title_cache_refresh_installed_games();
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < g_installed_game_count && (!out_games || count < max_games); ++i) {
+        if (g_installed_games[i].max_players >= min_players) {
+            if (out_games && count < max_games) {
+                out_games[count] = g_installed_games[i];
+            }
+            count++;
+        }
+    }
     return count;
+}
+
+void title_cache_build_json_games_attr(char *out, size_t out_size, int min_players) {
+    if (!out || out_size < 3) {
+        if (out && out_size > 0) out[0] = '\0';
+        return;
+    }
+
+    if (!g_inventory_loaded) {
+        title_cache_refresh_installed_games();
+    }
+
+    size_t count = 0;
+    for (size_t i = 0; i < g_installed_game_count; ++i) {
+        if (g_installed_games[i].max_players >= min_players) {
+            count++;
+        }
+    }
+
+    char *games_json = malloc(8192);
+    if (!games_json) {
+        snprintf(out, out_size, "{\"count\":%zu,\"min_players\":%d,\"games\":[]}", count, min_players);
+        return;
+    }
+    title_cache_build_json_games_list_for_attr(games_json, 8192, min_players);
+
+    snprintf(out, out_size, "{\"count\":%zu,\"min_players\":%d,\"games\":%s}", count, min_players, games_json);
+    free(games_json);
+}
+
+bool title_cache_find_application_id_by_name(const char *name, u64 *out_application_id) {
+    if (!name || name[0] == '\0' || !out_application_id) {
+        return false;
+    }
+
+    char query[256];
+    snprintf(query, sizeof(query), "%s", name);
+    trim_line(query);
+
+    if (strcasecmp(query, "Home Menu") == 0 || strcasecmp(query, "Home") == 0 ||
+        strcasecmp(query, "None") == 0 || strcasecmp(query, "none") == 0 ||
+        strcasecmp(query, "off") == 0 || strcasecmp(query, "idle") == 0) {
+        return false;
+    }
+
+    // Try parsing as raw hex title ID
+    u64 direct_id = 0;
+    if (parse_title_id(query, &direct_id)) {
+        *out_application_id = direct_id;
+        return true;
+    }
+
+    if (!g_inventory_loaded) {
+        title_cache_refresh_installed_games();
+    }
+
+    // 1. Exact case-insensitive match against installed games
+    for (size_t i = 0; i < g_installed_game_count; ++i) {
+        if (strcasecmp(g_installed_games[i].name, query) == 0) {
+            *out_application_id = g_installed_games[i].application_id;
+            return true;
+        }
+    }
+
+    // 2. Prefix / containment match against installed games
+    for (size_t i = 0; i < g_installed_game_count; ++i) {
+        if (case_str_search(query, g_installed_games[i].name) != NULL ||
+            case_str_search(g_installed_games[i].name, query) != NULL) {
+            *out_application_id = g_installed_games[i].application_id;
+            return true;
+        }
+    }
+
+    // 3. Search in titles.txt database
+    FILE *file = fopen(TITLE_CACHE_PATH, "r");
+    if (file) {
+        char line[640];
+        while (fgets(line, sizeof(line), file)) {
+            trim_line(line);
+            char *sep = strchr(line, ';');
+            if (!sep) continue;
+            *sep = '\0';
+            const char *title_name = sep + 1;
+            if (strcasecmp(title_name, query) == 0 || case_str_search(title_name, query) != NULL) {
+                u64 app_id = 0;
+                if (parse_title_id(line, &app_id)) {
+                    *out_application_id = app_id;
+                    fclose(file);
+                    return true;
+                }
+            }
+        }
+        fclose(file);
+    }
+
+    return false;
+}
+
+static Result launch_installed_application(u64 application_id) {
+    Result rc = nsInitialize();
+    if (R_FAILED(rc)) return rc;
+
+    u64 pid = 0;
+    if (hosversionBefore(3, 0, 0)) {
+        rc = serviceDispatchInOut(nsGetServiceSession_ApplicationManagerInterface(), 19, application_id, pid);
+    } else {
+        Service manager;
+        rc = nsGetApplicationManagerInterface(&manager);
+        if (R_SUCCEEDED(rc)) {
+            if (hosversionBefore(6, 0, 0)) {
+                const u32 command = hosversionAtLeast(5, 0, 0) ? 91 : 19;
+                rc = serviceDispatchInOut(&manager, command, application_id, pid);
+            } else {
+                // NS commands 95 and 94 retrieve launch info and launch program index zero.
+                // The opaque launch-info payload grew on HOS 18 and 19.
+                const u32 info_size = hosversionAtLeast(19, 0, 0) ? 0x80 : hosversionAtLeast(18, 0, 0) ? 0x50 : 0x40;
+                u64 request[0x88 / sizeof(u64)] = {0};
+                rc = serviceDispatchImpl(&manager, 95, &application_id, sizeof(application_id),
+                                         request + 1, info_size, (SfDispatchParams){0});
+                if (R_SUCCEEDED(rc)) {
+                    rc = serviceDispatchImpl(&manager, 94, request, info_size + sizeof(u64),
+                                             &pid, sizeof(pid), (SfDispatchParams){0});
+                }
+            }
+            serviceClose(&manager);
+        }
+    }
+    nsExit();
+    return rc;
+}
+
+bool title_cache_launch_game(AppState *state, u64 application_id) {
+    if (application_id == 0) {
+        return false;
+    }
+
+    char name[128] = "";
+    if (!title_cache_lookup(application_id, name, sizeof(name))) {
+        snprintf(name, sizeof(name), "0x%016llX", (unsigned long long) application_id);
+    }
+
+    app_state_push_log(state, "Launching game: %s (0x%016llX)", name, (unsigned long long) application_id);
+
+    Result rc = state && state->app_mode == AppMode_Sysmodule
+                    ? launch_installed_application(application_id)
+                    : appletRequestLaunchApplication(application_id, NULL);
+
+    if (R_SUCCEEDED(rc)) {
+        app_state_push_log(state, "Game launch requested: %s", name);
+        if (state) {
+            mutexLock(&state->lock);
+            state->sensor_publish_requested = true;
+            mutexUnlock(&state->lock);
+        }
+        return true;
+    } else {
+        app_state_push_log(state, "Game launch failed: rc=0x%x", rc);
+        return false;
+    }
 }

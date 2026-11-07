@@ -1,1 +1,1 @@
-APP_VERSION ?= 1.12.0
+APP_VERSION ?= 2.0.1-faserf-fork

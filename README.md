@@ -180,13 +180,21 @@ Main entities:
 | Commands | reboot, shutdown |
 | Notifications | Home Assistant popup on the Switch |
 
+### FaserF controls and sensors
+
+This branch integrates [FaserF/switch-assistant](https://github.com/FaserF/switch-assistant) at commit `7f19852` and preserves the fork's MQTT client ID, Operation Mode and SD space entities. Operation Mode keeps its retained `Sleep` value when the broker detects a lost connection.
+
+Home Assistant exposes Sleep, Close Game, Launch Daybreak, Fetch Diagnostics & Logs, volume and brightness buttons, the screen switch, a volume slider, and game selectors for all installed titles and multiplayer filters. It also exposes an overlay action event and firmware and Atmosphère version entities. The MQTT integration uses supported buttons, numbers, switches, and selects for these controls.
+
+The launcher and power commands depend on the console's firmware and permissions. The firmware and Atmosphère entities report detected versions and can request an update action. Install firmware manually through Daybreak. The Daybreak command preserves files in `sdmc:/firmware`. RTSP is opt-in in the NRO settings.
+
 ### Additional sensors
 
 The sysmodule publishes the following entities in addition to the existing battery, game, controller, operation mode, and SD card sensors.
 
 | Entity | Reading |
 | --- | --- |
-| Docked | Binary state based on the same charger detection as Operation Mode. |
+| Docked | Dock state from the system operation mode when available, with charger detection as a fallback. |
 | Player 1–8 Controller Wired | Wired connection for each detected player controller. |
 | SoC Temperature and Uptime | SoC temperature in °C when available and console uptime in seconds. |
 | Wi-Fi Signal Strength | 0–3 bars on Wi-Fi. Unset on Ethernet or when Wi-Fi status is unavailable. |
@@ -196,7 +204,7 @@ The sysmodule publishes the following entities in addition to the existing batte
 | 2-, 4-, and 8+ Player Games | Counts of installed games by minimum player capacity, with a `games` attribute. |
 | Diagnostics | Service readiness and whether the installed-game inventory loaded. |
 
-Multiplayer counts use the [title rules from FaserF](https://github.com/FaserF/switch-assistant). To override a game's player capacity, set `TITLE_ID=4` or `Game Name=4` in `sdmc:/switch/switch-ha/players.ini` and reboot. The inventory is loaded once per boot in a separate thread.
+Multiplayer counts use the [title rules from FaserF](https://github.com/FaserF/switch-assistant). To override a game's player capacity, set `TITLE_ID=4` or `Game Name=4` in `sdmc:/switch/switch-ha/players.ini` and reboot. The inventory is loaded once per boot before connecting to MQTT.
 
 ## Live Streaming
 
