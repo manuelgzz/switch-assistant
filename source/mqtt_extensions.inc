@@ -2,7 +2,6 @@
 static u64 ext_connections, ext_session_started, ext_game_started, ext_game_id, ext_next_poll;
 static bool ext_ts, ext_nifm;
 static Service ext_omm_service;
-static float ext_unmute = 50;
 
 static bool ext_docked(bool *docked) {
     if(!serviceIsActive(&ext_omm_service)) smGetService(&ext_omm_service,"omm");
@@ -31,7 +30,6 @@ static const char *ext_capability(const char *id) {
     if(strncmp(id,"player_",7)==0 || strcmp(id,"controller_count")==0)return "hid";
     if(strcmp(id,"soc_temperature")==0)return "ts";
     if(strcmp(id,"wifi_bars")==0 || strcmp(id,"connection_type")==0)return "nifm";
-    if(strncmp(id,"current_game",12)==0 || strcmp(id,"game_running")==0 || strcmp(id,"game_session")==0 || strcmp(id,"close_game")==0)return "pminfo";
     return NULL;
 }
 static void ext_availability(const AppConfig*c,const char*id,char*json,size_t size) {
@@ -73,14 +71,16 @@ static void extended_discovery(AppState *state, int fd, const AppConfig *c) {
     ext_entity(fd,c,"number","set_volume","Volume control",",\"min\":0,\"max\":100,\"step\":1,\"unit_of_meas\":\"%\"",true);
     ext_entity(fd,c,"switch","screen","Screen control",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
     ext_entity(fd,c,"switch","mute","Mute",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
-    ext_entity(fd,c,"switch","stream_enabled","RTSP capture",",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"",true);
+    clear_discovery_topic(fd,c,"switch","stream_enabled");
+    clear_discovery_topic(fd,c,"button","sleep");
     ext_entity(fd,c,"sensor","stream_clients","RTSP clients","",false);
     ext_entity(fd,c,"sensor","stream_error","RTSP capture result","",false);
-    const char *buttons[][2]={{"volume_up","Volume up"},{"volume_down","Volume down"},{"get_logs","Fetch diagnostics"},{"refresh","Refresh sensors"},{"sleep","Sleep"},{"close_game","Close game"},{"refresh_games","Refresh installed games"}};
+    const char *buttons[][2]={{"volume_up","Volume up"},{"volume_down","Volume down"},{"get_logs","Fetch diagnostics"},{"refresh","Refresh sensors"},{"close_game","Close game"},{"refresh_games","Refresh installed games"}};
     for(size_t i=0;i<sizeof(buttons)/sizeof(buttons[0]);i++) ext_entity(fd,c,"button",buttons[i][0],buttons[i][1],",\"payload_press\":\"PRESS\"",true);
     ext_entity(fd,c,"event","overlay_action","Overlay action",",\"event_types\":[\"quick_action_1\",\"quick_action_2\",\"quick_action_3\",\"quick_action_4\"]",false);
     const char *sensors[][3]={{"uptime","Console uptime",",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\""},{"mqtt_reconnections","MQTT reconnections",""},{"mqtt_session","MQTT session duration",",\"unit_of_meas\":\"s\""},{"soc_temperature","Internal temperature",",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\""},{"wifi_bars","Wi-Fi signal bars",",\"icon\":\"mdi:wifi\""},{"connection_type","Connection type",""},{"process_memory","Sysmodule memory",",\"unit_of_meas\":\"MiB\""},{"sd_total","SD capacity",",\"unit_of_meas\":\"GiB\""},{"internal_free","Internal free space",",\"unit_of_meas\":\"GiB\""},{"internal_total","Internal capacity",",\"unit_of_meas\":\"GiB\""},{"game_session","Game session duration",",\"unit_of_meas\":\"s\""},{"stream_status","RTSP status",""},{"command_status","Last command result",""}};
     for(size_t i=0;i<sizeof(sensors)/sizeof(sensors[0]);i++) ext_entity(fd,c,"sensor",sensors[i][0],sensors[i][1],sensors[i][2],false);
+    ext_entity(fd,c,"sensor","game_query_status","Game detection diagnostic",",\"ent_cat\":\"diagnostic\"",false);
     ext_entity(fd,c,"binary_sensor","docked","Docked","",false);
     char diagnostic_topic[192],diagnostic_extra[320];
     state_topic(c,"diagnostic_attributes",diagnostic_topic,sizeof(diagnostic_topic));
@@ -151,7 +151,9 @@ static void extended_poll(AppState *s,int fd,const AppConfig*c) {
         if(game!=ext_game_id) {ext_game_id=game;ext_game_started=now;}
         ext_number(fd,c,"game_session",(now-ext_game_started)/1000);
     } else {ext_game_id=0;ext_number(fd,c,"game_session",0);}
-    publish_value(fd,c,"stream_enabled",screen_stream_is_enabled()?"ON":"OFF");
+    char game_query_status[SHA_LOG_LINE];
+    mutexLock(&s->lock);snprintf(game_query_status,sizeof(game_query_status),"%s",s->game_status);mutexUnlock(&s->lock);
+    publish_value(fd,c,"game_query_status",game_query_status);
     ext_number(fd,c,"stream_clients",screen_stream_client_count());
     char result[32];snprintf(result,sizeof(result),"0x%x",screen_stream_get_grcd_begin_result());
     publish_value(fd,c,"stream_error",result);
@@ -165,10 +167,10 @@ static void extended_poll(AppState *s,int fd,const AppConfig*c) {
         if(R_SUCCEEDED(lblGetBacklightSwitchStatus(&bl))) publish_value(fd,c,"screen",bl==LblBacklightSwitchStatus_Enabled?"ON":"OFF");
     }
     if(s->svc_audctl_ready) {
-        AudioTarget target; s32 vol,min,max;
-        if(R_SUCCEEDED(audctlGetActiveOutputTarget(&target)) && R_SUCCEEDED(audctlGetTargetVolume(&vol,target)) && R_SUCCEEDED(audctlGetTargetVolumeMin(&min)) && R_SUCCEEDED(audctlGetTargetVolumeMax(&max)) && max>min) {
-            ext_number(fd,c,"set_volume",100.0*(vol-min)/(max-min));
-            publish_value(fd,c,"mute",vol==min?"ON":"OFF");
+        AudioVolumeState audio;
+        if(R_SUCCEEDED(audio_control_read(&audio))) {
+            ext_number(fd,c,"set_volume",audio.percent);
+            publish_value(fd,c,"mute",audio.muted?"ON":"OFF");
         }
     }
     if(s->svc_hid_ready) for(int i=0;i<8;i++) {
@@ -272,7 +274,8 @@ static bool extended_command(AppState*s,int fd,const AppConfig*c,const char*kind
     const char *cmd=strcmp(kind,"command")==0?payload:kind;
     Result rc=MAKERESULT(Module_Libnx,LibnxError_NotInitialized);
     if(strcmp(cmd,"stream_enabled")==0) {
-        if(strcmp(payload,"ON")==0 || strcmp(payload,"OFF")==0) {screen_stream_set_enabled(strcmp(payload,"ON")==0);rc=0;}
+        publish_value(fd,c,"command_status","stream_enabled:removed");
+        return true;
     }
     else if(strcmp(cmd,"refresh")==0) { mutexLock(&s->lock);s->sensor_publish_requested=true;mutexUnlock(&s->lock);rc=0; }
     else if(strcmp(cmd,"get_logs")==0) {
@@ -288,16 +291,17 @@ static bool extended_command(AppState*s,int fd,const AppConfig*c,const char*kind
             }
         }
     } else if(strcmp(cmd,"set_volume")==0 || strcmp(cmd,"volume_up")==0 || strcmp(cmd,"volume_down")==0 || strcmp(cmd,"mute")==0) {
-        AudioTarget target; s32 vol,min,max;
-        if(s->svc_audctl_ready && R_SUCCEEDED(audctlGetActiveOutputTarget(&target)) && R_SUCCEEDED(audctlGetTargetVolume(&vol,target)) && R_SUCCEEDED(audctlGetTargetVolumeMin(&min)) && R_SUCCEEDED(audctlGetTargetVolumeMax(&max)) && max>min) {
-            float v=100.0f*(vol-min)/(max-min); bool valid=true;
-            if(strcmp(cmd,"volume_up")==0) v+=5;
-            else if(strcmp(cmd,"volume_down")==0) v-=5;
-            else if(strcmp(cmd,"mute")==0) {if(strcmp(payload,"ON")==0){if(v>0)ext_unmute=v;v=0;}else if(strcmp(payload,"OFF")==0)v=ext_unmute;else valid=false;}
-            else {char*end;v=strtof(payload,&end);valid=end!=payload && *end==0 && v>=0 && v<=100;}
-            if(v<0)v=0;
-            if(v>100)v=100;
-            if(valid)rc=audctlSetTargetVolume(target,min+(s32)((max-min)*v/100));
+        if(s->svc_audctl_ready) {
+            if(strcmp(cmd,"volume_up")==0) rc=audio_control_step(1);
+            else if(strcmp(cmd,"volume_down")==0) rc=audio_control_step(-1);
+            else if(strcmp(cmd,"mute")==0) {
+                if(strcmp(payload,"ON")==0 || strcmp(payload,"OFF")==0)
+                    rc=audio_control_set_mute(strcmp(payload,"ON")==0);
+                else rc=MAKERESULT(Module_Libnx,LibnxError_BadInput);
+            } else {
+                char *end;float percent=strtof(payload,&end);
+                rc=(end!=payload && *end==0)?audio_control_set_percent(percent):MAKERESULT(Module_Libnx,LibnxError_BadInput);
+            }
         }
     } else if(strcmp(cmd,"refresh_games")==0) {ext_games_refresh(fd,c);return true;}
     else if(strcmp(cmd,"game")==0 || strcmp(cmd,"game_2p")==0 || strcmp(cmd,"game_4p")==0 || strcmp(cmd,"game_8p")==0) {
@@ -313,16 +317,10 @@ static bool extended_command(AppState*s,int fd,const AppConfig*c,const char*kind
             rc=pmshellInitialize();
             if(R_SUCCEEDED(rc)){rc=pmshellTerminateProgram(program);pmshellExit();}
         }
-    } else if(strcmp(cmd,"sleep")==0) {
-        if(s->app_mode==AppMode_ForegroundApp) rc=appletRequestToSleep();
-        else {
-            /* Privileged sleep syscall; never dispatch SPSM command 1 (error state). */
-            publish_value(fd,c,"command_status","sleep:accepted");
-            publish_value(fd,c,"operation_mode","Sleep");
-            publish_value(fd,c,"availability","offline");
-            svcSleepSystem();
-            return true;
-        }
+    } else if(strcmp(cmd,"sleep")==0 || strcmp(cmd,"standby")==0) {
+        /* Disabled after a console crash. Never invoke privileged sleep from MQTT. */
+        publish_value(fd,c,"command_status","sleep:disabled");
+        return true;
     } else return false;
     ext_result(fd,c,cmd,rc);
     ext_next_poll=0;

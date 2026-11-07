@@ -24,10 +24,13 @@ jobs:
       - name: Test MQTT protocol and discovery
         run: |
           set -euo pipefail
-          python3 tests/test_mqtt_discovery.py
-          python3 tests/test_mqtt_commands.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
           gcc -Wall -Wextra -Werror -fsanitize=address,undefined -pthread -Iinclude tests/mqtt_wire_test.c -o /tmp/mqtt-wire-test
           /tmp/mqtt-wire-test
+          gcc -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/stubs -Iinclude source/audio_control.c tests/audio_control_test.c -o /tmp/audio-control-test
+          /tmp/audio-control-test
+          gcc -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/stubs -Iinclude source/game_query.c tests/game_query_test.c -o /tmp/game-query-test
+          /tmp/game-query-test
 
       - name: Build NRO
         run: |

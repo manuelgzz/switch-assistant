@@ -37,9 +37,11 @@ static void mqtt_send_publish(int fd,const char*topic,const char*payload,bool re
  (void)fd;(void)retain;printf("%s\t%s\n",topic,payload);
 }
 '''
-        names = ["sanitize_id", "client_id_or_device", "state_topic", "discovery_topic"]
+        prelude += "\nstatic void clear_discovery_topic(int fd,const AppConfig*c,const char*type,const char*id);\n"
+        names = ["sanitize_id", "client_id_or_device", "state_topic", "discovery_topic", "clear_discovery_topic"]
         code = prelude + "\n".join(function(main, n) for n in names)
         code += "\n" + "\n".join(function(ext, n) for n in ["ext_escape", "ext_capability", "ext_availability", "ext_entity", "extended_discovery"])
+        code += "\n" + function(main, "publish_discovery_sensor")
         code += r'''
 int main(void) {
  AppConfig a={.device_name="Switch \"living\\room\"",.mqtt_client_id="switch-a",.mqtt_topic_prefix="homeassistant"};
@@ -49,6 +51,9 @@ int main(void) {
  ext_entity(1,&a,"sensor","process_memory","Memory",",\"unit_of_meas\":\"MiB\"",false);
  ext_entity(1,&a,"event","overlay_action","Actions",",\"event_types\":[\"quick_action_1\"]",false);
  AppState state={0};extended_discovery(&state,1,&a);
+ publish_discovery_sensor(1,&a,"sensor","current_game","Current game",NULL,NULL,NULL);
+ publish_discovery_sensor(1,&a,"sensor","current_game_id","Title ID",NULL,NULL,NULL);
+ publish_discovery_sensor(1,&a,"binary_sensor","game_running","Game running","running",NULL,NULL);
 }
 '''
         with tempfile.TemporaryDirectory() as temp:
@@ -58,8 +63,12 @@ int main(void) {
             subprocess.run(["gcc", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", str(c), "-o", str(binary)], check=True)
             result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
         packets = []
+        removed = []
         for line in result.stdout.splitlines():
             topic, payload = line.split("\t", 1)
+            if not payload:
+                removed.append(topic)
+                continue
             # Duplicate fields hide malformed availability declarations.
             def unique(pairs):
                 output = {}
@@ -69,6 +78,8 @@ int main(void) {
                 return output
             packets.append((topic, json.loads(payload, object_pairs_hook=unique)))
         self.assertGreater(len(packets), 40)
+        self.assertIn("homeassistant/button/switch_a/sleep/config", removed)
+        self.assertIn("homeassistant/switch/switch_a/stream_enabled/config", removed)
         a, b = packets[0][1], packets[1][1]
         self.assertNotEqual(a["cmd_t"], b["cmd_t"])
         self.assertNotEqual(a["uniq_id"], b["uniq_id"])
@@ -88,6 +99,11 @@ int main(void) {
                 self.assertEqual(entity["payload_press"], "PRESS")
                 self.assertTrue(entity["cmd_t"].startswith("switch_ha/switch_a/control/"))
             self.assertNotIn("daybreak", topic)
+            self.assertNotIn("/sleep/", topic)
+            self.assertNotIn("/stream_enabled/", topic)
+        for topic, entity in packets[-3:]:
+            self.assertEqual(entity["avty_t"], "switch_ha/switch_a/availability")
+            self.assertNotIn("avty", entity)
         print(f"Validated {len(packets)} discovery payloads")
 
 

@@ -15,6 +15,4 @@ void screen_stream_get_status(char *out, size_t out_size);
 Result screen_stream_get_grcd_open_result(void);
 Result screen_stream_get_grcd_begin_result(void);
 
-void screen_stream_set_enabled(bool enabled);
-bool screen_stream_is_enabled(void);
 unsigned screen_stream_client_count(void);

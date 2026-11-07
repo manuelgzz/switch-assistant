@@ -1,5 +1,7 @@
 #include "mqtt_client.h"
 #include "mqtt_wire.h"
+#include "audio_control.h"
+#include "game_query.h"
 #include "screen_stream.h"
 #include "title_cache.h"
 
@@ -733,20 +735,20 @@ static bool scan_process_list_for_known_game(AppState *state, u64 *pid_out, u64 
 }
 
 static bool current_game(AppState *state, u64 *application_id, char *name, size_t name_size) {
-    if (!state->svc_pminfo_ready) {
-        set_game_status(state, "pminfo unavailable");
-        return false;
-    }
-
-    u64 program_id = 0;
-    u64 pid = 0;
-
-    if (scan_process_list_for_known_game(state, &pid, &program_id, name, name_size)) {
+    u64 program_id = 0, pid = 0;
+    Result rc = game_query_current(&pid, &program_id);
+    if (R_SUCCEEDED(rc) && pid && program_id) {
         *application_id = program_id;
-        set_game_status(state, "running scan=0x%016llx pid=%llu", (unsigned long long) program_id, (unsigned long long) pid);
+        if (!title_cache_lookup(program_id, name, name_size))
+            snprintf(name, name_size, "Unknown game [%016llX]", (unsigned long long)program_id);
+        set_game_status(state, "running direct=0x%016llx pid=%llu", (unsigned long long)program_id, (unsigned long long)pid);
         return true;
     }
-
+    if (state->svc_pminfo_ready && scan_process_list_for_known_game(state, &pid, &program_id, name, name_size)) {
+        *application_id = program_id;
+        return true;
+    }
+    set_game_status(state, "application query rc=0x%x pid=%llu", rc, (unsigned long long)pid);
     return false;
 }
 
@@ -1023,30 +1025,11 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     }
 
     if (state->svc_audctl_ready) {
-        AudioTarget audio_target = AudioTarget_Invalid;
-        if (R_SUCCEEDED(audctlGetActiveOutputTarget(&audio_target)) || R_SUCCEEDED(audctlGetDefaultTarget(&audio_target))) {
-            publish_if_changed(fd, config, snapshot, force, "audio_target", snapshot->audio_target, sizeof(snapshot->audio_target),
-                               audio_target_name(audio_target));
-
-            s32 target_volume = 0;
-            s32 min_volume = 0;
-            s32 max_volume = 0;
-            if (R_SUCCEEDED(audctlGetTargetVolume(&target_volume, audio_target)) &&
-                R_SUCCEEDED(audctlGetTargetVolumeMin(&min_volume)) &&
-                R_SUCCEEDED(audctlGetTargetVolumeMax(&max_volume)) &&
-                max_volume > min_volume) {
-                double pct = ((double) (target_volume - min_volume) * 100.0) / (double) (max_volume - min_volume);
-                if (pct < 0.0) pct = 0.0;
-                if (pct > 100.0) pct = 100.0;
-                snprintf(value, sizeof(value), "%.0f", pct);
-                publish_if_changed(fd, config, snapshot, force, "volume", snapshot->volume, sizeof(snapshot->volume), value);
-            } else {
-                float master_volume = 0.0f;
-                if (R_SUCCEEDED(audctlGetSystemOutputMasterVolume(&master_volume))) {
-                    snprintf(value, sizeof(value), "%.0f", (double) (master_volume * 100.0f));
-                    publish_if_changed(fd, config, snapshot, force, "volume", snapshot->volume, sizeof(snapshot->volume), value);
-                }
-            }
+        AudioVolumeState audio;
+        if (R_SUCCEEDED(audio_control_read(&audio))) {
+            publish_if_changed(fd, config, snapshot, force, "audio_target", snapshot->audio_target, sizeof(snapshot->audio_target), audio_target_name(audio.target));
+            snprintf(value, sizeof(value), "%.0f", (double)audio.percent);
+            publish_if_changed(fd, config, snapshot, force, "volume", snapshot->volume, sizeof(snapshot->volume), value);
         }
     }
 
@@ -1209,7 +1192,7 @@ static void handle_command_payload(AppState *state, int fd, const AppConfig *con
         app_state_push_log(state, "Shutdown command accepted");
         ext_result(fd,config,"shutdown",spsmShutdown(false));
     } else if (strcasecmp(payload, "sleep") == 0 || strcasecmp(payload, "standby") == 0) {
-        extended_command(state,fd,config,"sleep","PRESS");
+        publish_value(fd,config,"command_status","sleep:disabled");
     } else {
         ext_result(fd,config,"unknown",MAKERESULT(Module_Libnx,LibnxError_BadInput));
     }
