@@ -167,3 +167,25 @@ controles retirados cuando el sysmodule nuevo reconecta y limpia su discovery.
 Las pruebas de audio usan dobles del servicio para verificar rutas de lectura,
 pasos de hardware, límites, mute nativo, alternativa master y restauración. No
 confirman la compatibilidad física de cada salida de audio o versión de firmware.
+
+
+## Corrección de inicio de juegos: 1.12.1-fix2
+
+El sysmodule reemplaza `__appInit`, por lo que debe inicializar explícitamente la
+versión de firmware que libnx usa para seleccionar los comandos IPC. Se añade
+esa inicialización antes de crear sesiones de servicios, también en el overlay.
+Si la versión sigue siendo desconocida, el componente queda inactivo y la consulta
+de juegos devuelve un error sin abrir `pm:dmnt`.
+
+En libnx, `pmdmntGetApplicationProcessId` usa el comando 4 desde firmware 5.0.0 y
+el comando 5 en firmware anterior. Con una versión sin inicializar, puede escoger
+el comando 5; en firmware moderno ese comando es `HookToCreateApplicationProcess`.
+Por eso no se debe consultar el proceso con una versión cero ni inventar una
+versión por defecto. La relación con el fallo observado desde HOME requiere
+confirmación en consola tras instalar el arreglo y reiniciar.
+
+Instalar `1.12.1-fix2` siguiendo los pasos de instalación anteriores y reiniciar
+completamente la consola antes de probar el inicio desde HOME. Si vuelve a fallar,
+el código/Program ID de la pantalla de error permite distinguir sysmodule,
+overlay u otro componente. Los selectores de lanzamiento desde el sysmodule
+siguen deshabilitados.

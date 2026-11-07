@@ -31,6 +31,8 @@ jobs:
           /tmp/audio-control-test
           gcc -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/stubs -Iinclude source/game_query.c tests/game_query_test.c -o /tmp/game-query-test
           /tmp/game-query-test
+          gcc -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/stubs -Iinclude tests/runtime_version_test.c -o /tmp/runtime-version-test
+          /tmp/runtime-version-test
 
       - name: Build NRO
         run: |

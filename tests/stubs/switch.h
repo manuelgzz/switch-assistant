@@ -3,6 +3,8 @@
 #include <stdbool.h>
 typedef uint32_t Result;
 typedef uint64_t u64;
+typedef uint32_t u32;
+typedef struct {uint8_t major, minor, micro;} SetSysFirmwareVersion;
 typedef int32_t s32;
 typedef enum {AudioTarget_Invalid=-1,AudioTarget_Speaker=0} AudioTarget;
 #define R_SUCCEEDED(r) ((r)==0)
@@ -27,3 +29,12 @@ Result pmdmntGetProgramId(u64*,u64);
 Result pminfoInitialize(void);
 void pminfoExit(void);
 Result pminfoGetProgramId(u64*,u64);
+
+#define LibnxError_IncompatSysVer 2
+#define MAKEHOSVERSION(a,b,c) (((a)<<16)|((b)<<8)|(c))
+u32 hosversionGet(void);
+void hosversionSet(u32 version);
+bool hosversionIsAtmosphere(void);
+Result setsysInitialize(void);
+void setsysExit(void);
+Result setsysGetFirmwareVersion(SetSysFirmwareVersion*);

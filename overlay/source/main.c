@@ -1,4 +1,5 @@
 #include <switch.h>
+#include "../../include/runtime_version.h"
 #include <switch/display/framebuffer.h>
 #include <switch/display/native_window.h>
 #include <switch/services/vi.h>
@@ -59,6 +60,12 @@ void __appInit(void) {
         fatalThrow(rc);
     }
     g_sm_ready = true;
+
+    rc = runtime_version_init();
+    if (R_FAILED(rc)) {
+        /* Do not create display/HID sessions with unknown IPC command versions. */
+        while (true) svcSleepThread(1000000000ULL);
+    }
 
     rc = fsInitialize();
     if (R_FAILED(rc)) {

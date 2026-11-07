@@ -2,6 +2,7 @@
 #include "config.h"
 #include "mqtt_client.h"
 #include "screen_stream.h"
+#include "runtime_version.h"
 
 #include <switch.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #define RESULT_OPTIONAL_TIMEOUT MAKERESULT(Module_Libnx, LibnxError_Timeout)
 #define RESULT_NOT_INITIALIZED MAKERESULT(Module_Libnx, LibnxError_NotInitialized)
 
+static Result g_runtime_version_result = RESULT_NOT_INITIALIZED;
 static Result g_socket_init_result = RESULT_NOT_INITIALIZED;
 static Result g_psm_init_result = RESULT_NOT_INITIALIZED;
 static Result g_spsm_init_result = RESULT_NOT_INITIALIZED;
@@ -42,6 +44,8 @@ void __appInit(void) {
     if (R_FAILED(rc)) {
         diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_SM));
     }
+
+    g_runtime_version_result = runtime_version_init();
 
     rc = fsInitialize();
     if (R_FAILED(rc)) {
@@ -90,6 +94,7 @@ static void append_log_result(const char *name, Result rc) {
 
 static void init_core_services(AppState *state) {
     append_log("core service init start");
+    append_log_result("runtime_version_init", g_runtime_version_result);
 
     Result rc = smInitialize();
     if (R_FAILED(rc)) {
@@ -327,6 +332,8 @@ static void write_heartbeat(AppState *state) {
 
     mutexLock(&state->lock);
     fprintf(file, "build=%s\n", SHA_APP_BUILD);
+    fprintf(file, "runtime_version=0x%x\n", hosversionGet());
+    fprintf(file, "runtime_version_init=0x%x\n", g_runtime_version_result);
     fprintf(file, "uptime_ms=%lu\n", monotonic_ms());
     fprintf(file, "config=%s\n", state->config_status);
     fprintf(file, "mqtt_connected=%d\n", state->mqtt_connected ? 1 : 0);
@@ -362,6 +369,11 @@ int main(int argc, char **argv) {
     app_state_init(&state);
     state.app_mode = AppMode_Sysmodule;
     append_log("sysmodule boot");
+    if (hosversionGet() == 0) {
+        append_log_result("runtime_version_init", g_runtime_version_result);
+        append_log("unknown firmware: services disabled to avoid incorrect IPC commands");
+        while (true) svcSleepThread(1000000000ULL);
+    }
 
     if (!config_load(&state.config)) {
         snprintf(state.config_status, sizeof(state.config_status), "no config");
