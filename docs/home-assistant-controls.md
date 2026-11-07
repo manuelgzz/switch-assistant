@@ -189,3 +189,25 @@ completamente la consola antes de probar el inicio desde HOME. Si vuelve a falla
 el código/Program ID de la pantalla de error permite distinguir sysmodule,
 overlay u otro componente. Los selectores de lanzamiento desde el sysmodule
 siguen deshabilitados.
+
+
+## Nombre de juego y Close Game: 1.12.1-fix3
+
+Se regenera el índice binario a partir de los bytes reales de `titles.txt` y se
+impide la conversión automática de finales de línea de ese catálogo en Git.
+Actions regenera el índice antes de comprobar y compilar los archivos incrustados.
+El lector del catálogo recupera el nombre mediante una búsqueda en texto si una
+entrada instalada apunta a una posición incorrecta. Las pruebas verifican todos
+los offsets y el caso `01006A800016E000` → `Super Smash Bros.™ Ultimate`, tanto
+con un índice correcto como con un índice generado con CRLF para un archivo LF.
+
+Close Game usa ahora el PID devuelto por la consulta de aplicación actual, sin
+depender del nombre, del índice ni de recorrer procesos. Si no hay aplicación o
+falla la consulta, no envía ninguna orden de terminación. El resultado real de
+`pmshellTerminateProcess` se publica en `command_status`; no se añade una llamada
+privilegiada de terminación como alternativa.
+
+El sensor Title ID ya reportaba el identificador correcto; no se cambia su
+formato. Instalar el NRO nuevo abriendo Switch Assistant y reiniciar para actualizar
+también el catálogo incrustado y el sysmodule. Guardar la partida antes de probar
+Close Game, porque termina la aplicación.

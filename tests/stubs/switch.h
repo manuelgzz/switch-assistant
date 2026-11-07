@@ -38,3 +38,8 @@ bool hosversionIsAtmosphere(void);
 Result setsysInitialize(void);
 void setsysExit(void);
 Result setsysGetFirmwareVersion(SetSysFirmwareVersion*);
+
+#define LibnxError_NotInitialized 3
+Result pmshellInitialize(void);
+void pmshellExit(void);
+Result pmshellTerminateProcess(u64 pid);

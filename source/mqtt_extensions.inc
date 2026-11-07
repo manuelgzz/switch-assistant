@@ -312,11 +312,7 @@ static bool extended_command(AppState*s,int fd,const AppConfig*c,const char*kind
             break;
         }
     } else if(strcmp(cmd,"close_game")==0) {
-        u64 pid=0,program=0;char name[512];
-        if(s->svc_pminfo_ready && scan_process_list_for_known_game(s,&pid,&program,name,sizeof(name))) {
-            rc=pmshellInitialize();
-            if(R_SUCCEEDED(rc)){rc=pmshellTerminateProgram(program);pmshellExit();}
-        }
+        rc=game_query_close_current();
     } else if(strcmp(cmd,"sleep")==0 || strcmp(cmd,"standby")==0) {
         /* Disabled after a console crash. Never invoke privileged sleep from MQTT. */
         publish_value(fd,c,"command_status","sleep:disabled");

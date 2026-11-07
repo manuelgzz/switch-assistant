@@ -23,3 +23,17 @@ Result game_query_current(u64 *pid, u64 *application_id) {
     pmdmntExit();
     return rc;
 }
+
+Result game_query_close_current(void) {
+    u64 pid = 0, application_id = 0;
+    Result rc = game_query_current(&pid, &application_id);
+    if (R_FAILED(rc)) return rc;
+    if (!pid || !application_id)
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    rc = pmshellInitialize();
+    if (R_FAILED(rc)) return rc;
+    /* No catalog scan, no process-list guessing, and no privileged syscall. */
+    rc = pmshellTerminateProcess(pid);
+    pmshellExit();
+    return rc;
+}

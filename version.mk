@@ -1,1 +1,1 @@
-APP_VERSION ?= 1.12.1-fix2
+APP_VERSION ?= 1.12.1-fix3

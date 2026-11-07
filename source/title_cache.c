@@ -102,7 +102,7 @@ static void title_index_load(void) {
 }
 
 static bool read_title_name_at_offset(u64 offset, char *out, size_t out_size) {
-    FILE *file = fopen(TITLE_CACHE_PATH, "r");
+    FILE *file = fopen(TITLE_CACHE_PATH, "rb");
     if (!file) {
         return false;
     }
@@ -143,6 +143,32 @@ static bool read_title_name_at_offset(u64 offset, char *out, size_t out_size) {
     return true;
 }
 
+/* Recover when an installed index was generated from different line endings.
+ * This path runs only for a matching index entry, then caches the resolved name. */
+static bool scan_title_name(u64 application_id, char *out, size_t out_size) {
+    FILE *file = fopen(TITLE_CACHE_PATH, "rb");
+    if (!file) return false;
+    char line[640];
+    while (fgets(line, sizeof(line), file)) {
+        char *separator = strchr(line, ';');
+        if (!separator) continue;
+        *separator = '\0';
+        u64 id = 0;
+        trim_line(line);
+        if (!parse_title_id(line, &id) || id != application_id) continue;
+        char *name = separator + 1;
+        trim_line(name);
+        if (!name[0]) continue;
+        snprintf(g_cached_name, sizeof(g_cached_name), "%s", name);
+        g_cached_application_id = id;
+        snprintf(out, out_size, "%s", name);
+        fclose(file);
+        return true;
+    }
+    fclose(file);
+    return false;
+}
+
 bool title_cache_lookup(u64 application_id, char *out, size_t out_size) {
     if (application_id == 0 || out_size == 0) {
         return false;
@@ -166,5 +192,7 @@ bool title_cache_lookup(u64 application_id, char *out, size_t out_size) {
         return false;
     }
 
-    return read_title_name_at_offset(entry->offset, out, out_size) && g_cached_application_id == application_id;
+    if (read_title_name_at_offset(entry->offset, out, out_size) && g_cached_application_id == application_id)
+        return true;
+    return scan_title_name(application_id, out, out_size);
 }

@@ -24,6 +24,7 @@ jobs:
       - name: Test MQTT protocol and discovery
         run: |
           set -euo pipefail
+          python3 scripts/generate-title-index.py
           python3 -m unittest discover -s tests -p 'test_*.py'
           gcc -Wall -Wextra -Werror -fsanitize=address,undefined -pthread -Iinclude tests/mqtt_wire_test.c -o /tmp/mqtt-wire-test
           /tmp/mqtt-wire-test

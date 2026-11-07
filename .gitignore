@@ -52,3 +52,6 @@ Thumbs.db
 .vscode/
 .idea/
 .tmp-*/
+
+# Python helper/test caches
+__pycache__/
