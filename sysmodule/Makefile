@@ -70,6 +70,8 @@ DEPENDS := $(OFILES:.o=.d)
 
 all: $(OUTPUT).nsp
 
+$(OUTPUT).npdm: $(APP_JSON)
+
 $(OUTPUT).nsp: $(OUTPUT).nso $(OUTPUT).npdm
 
 $(OUTPUT).elf: $(OFILES)

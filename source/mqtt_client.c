@@ -1,4 +1,5 @@
 #include "mqtt_client.h"
+#include "mqtt_wire.h"
 #include "screen_stream.h"
 #include "title_cache.h"
 
@@ -315,9 +316,9 @@ static bool mqtt_send_connect(const AppConfig* config, int fd) {
     ptr = write_string(ptr, config->mqtt_client_id[0] ? config->mqtt_client_id : config->device_name);
 
     char will_topic[192];
-    state_topic(config, "operation_mode", will_topic, sizeof(will_topic));
+    state_topic(config, "availability", will_topic, sizeof(will_topic));
     ptr = write_string(ptr, will_topic);
-    ptr = write_string(ptr, "Sleep");
+    ptr = write_string(ptr, "offline");
 
     if (config->mqtt_username[0] != '\0') {
         ptr = write_string(ptr, config->mqtt_username);
@@ -778,12 +779,17 @@ static void discovery_topic(const AppConfig *config, const char *component, cons
     snprintf(topic, topic_size, "%s/%s/%s/%s/config", config->mqtt_topic_prefix, component, safe_id, sensor);
 }
 
+static void ext_escape(const char *, char *, size_t);
+static bool ext_docked(bool *);
+static void ext_availability(const AppConfig *,const char *,char *,size_t);
+
 static void publish_discovery_sensor(int fd, const AppConfig *config, const char *component, const char *sensor,
                                      const char *name, const char *device_class, const char *unit, const char *state_class) {
     char topic[256];
     char state[192];
     char payload[MQTT_BUFFER];
     char safe_id[80];
+    char escaped_name[400]; ext_escape(config->device_name,escaped_name,sizeof(escaped_name));
 
     sanitize_id(client_id_or_device(config), safe_id, sizeof(safe_id));
     discovery_topic(config, component, sensor, topic, sizeof(topic));
@@ -796,7 +802,7 @@ static void publish_discovery_sensor(int fd, const AppConfig *config, const char
              sensor,
              state,
              safe_id,
-             config->device_name,
+             escaped_name,
              device_class ? ",\"dev_cla\":\"" : "",
              device_class ? device_class : "",
              device_class ? "\"" : "",
@@ -817,6 +823,7 @@ static void publish_discovery_sensor(int fd, const AppConfig *config, const char
         }
     }
 
+    ext_availability(config, sensor, payload, sizeof(payload));
     mqtt_send_publish(fd, topic, payload, true);
 }
 
@@ -825,10 +832,11 @@ static void publish_discovery_button(int fd, const AppConfig *config, const char
     char command_topic[SHA_MAX_TOPIC + 32];
     char payload[MQTT_BUFFER];
     char safe_id[80];
+    char escaped_name[400]; ext_escape(config->device_name,escaped_name,sizeof(escaped_name));
 
     sanitize_id(client_id_or_device(config), safe_id, sizeof(safe_id));
     discovery_topic(config, "button", button, topic, sizeof(topic));
-    snprintf(command_topic, sizeof(command_topic), "%s/command", config->mqtt_topic_prefix);
+    state_topic(config, "command", command_topic, sizeof(command_topic));
 
     snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\",\"uniq_id\":\"%s_%s\",\"cmd_t\":\"%s\",\"payload_press\":\"%s\",\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"Nintendo\",\"mdl\":\"Switch\"}}",
@@ -838,8 +846,9 @@ static void publish_discovery_button(int fd, const AppConfig *config, const char
              command_topic,
              payload_press,
              safe_id,
-             config->device_name);
+             escaped_name);
 
+    ext_availability(config, button, payload, sizeof(payload));
     mqtt_send_publish(fd, topic, payload, true);
 }
 
@@ -848,6 +857,7 @@ static void publish_discovery_notify(int fd, const AppConfig *config, const char
     char command_topic[192];
     char payload[MQTT_BUFFER];
     char safe_id[80];
+    char escaped_name[400]; ext_escape(config->device_name,escaped_name,sizeof(escaped_name));
 
     sanitize_id(client_id_or_device(config), safe_id, sizeof(safe_id));
     discovery_topic(config, "notify", mode, topic, sizeof(topic));
@@ -862,8 +872,9 @@ static void publish_discovery_notify(int fd, const AppConfig *config, const char
              mode,
              command_topic,
              safe_id,
-             config->device_name);
+             escaped_name);
 
+    ext_availability(config, mode, payload, sizeof(payload));
     mqtt_send_publish(fd, topic, payload, true);
 }
 
@@ -873,13 +884,18 @@ static void clear_discovery_topic(int fd, const AppConfig *config, const char *c
     mqtt_send_publish(fd, topic, "", true);
 }
 
+static void extended_discovery(AppState *, int, const AppConfig *);
+static void extended_poll(AppState *, int, const AppConfig *);
+static bool extended_command(AppState *, int, const AppConfig *, const char *, const char *);
+
 static void publish_sensor_discovery(AppState *state, int fd, const AppConfig *config) {
+    extended_discovery(state, fd, config);
 
     publish_discovery_sensor(fd, config, "sensor", "battery", "Battery Level", "battery", "%", "measurement");
     publish_discovery_sensor(fd, config, "binary_sensor", "charging", "Is Charging", "battery_charging", NULL, NULL);
     publish_discovery_sensor(fd, config, "sensor", "charger_type", "Charger Type", NULL, NULL, NULL);
     publish_discovery_sensor(fd, config, "sensor", "battery_voltage", "Battery Voltage", "voltage", "mV", "measurement");
-    publish_discovery_sensor(fd, config, "sensor", "battery_temperature", "Battery Temperature", "temperature", "C", "measurement");
+    publish_discovery_sensor(fd, config, "sensor", "battery_temperature", "Battery Temperature", "temperature", "\xc2\xb0" "C", "measurement");
     publish_discovery_sensor(fd, config, "sensor", "battery_health", "Battery Health", NULL, "%", "measurement");
 
     if (state->svc_lbl_ready) {
@@ -962,7 +978,7 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
         snprintf(value, sizeof(value), "%u", percent);
         publish_if_changed(fd, config, snapshot, force, "battery", snapshot->battery, sizeof(snapshot->battery), value);
     } else if (force) {
-        publish_if_changed(fd, config, snapshot, force, "battery", snapshot->battery, sizeof(snapshot->battery), "0");
+        publish_if_changed(fd, config, snapshot, force, "battery", snapshot->battery, sizeof(snapshot->battery), "None");
     }
 
     if (R_SUCCEEDED(psmGetChargerType(&charger))) {
@@ -985,9 +1001,9 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
         snprintf(value, sizeof(value), "%.1f", (double) info.battery_age_percentage / 1000.0);
         publish_if_changed(fd, config, snapshot, force, "battery_health", snapshot->battery_health, sizeof(snapshot->battery_health), value);
     } else if (force) {
-        publish_if_changed(fd, config, snapshot, force, "battery_voltage", snapshot->battery_voltage, sizeof(snapshot->battery_voltage), "0");
-        publish_if_changed(fd, config, snapshot, force, "battery_temperature", snapshot->battery_temperature, sizeof(snapshot->battery_temperature), "0");
-        publish_if_changed(fd, config, snapshot, force, "battery_health", snapshot->battery_health, sizeof(snapshot->battery_health), "0");
+        publish_if_changed(fd, config, snapshot, force, "battery_voltage", snapshot->battery_voltage, sizeof(snapshot->battery_voltage), "None");
+        publish_if_changed(fd, config, snapshot, force, "battery_temperature", snapshot->battery_temperature, sizeof(snapshot->battery_temperature), "None");
+        publish_if_changed(fd, config, snapshot, force, "battery_health", snapshot->battery_health, sizeof(snapshot->battery_health), "None");
     }
 
     if (power_sleeping) {
@@ -1103,11 +1119,9 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     if (power_sleeping) {
         snprintf(current_mode, sizeof(current_mode), "Sleep");
     }
-    else if (R_SUCCEEDED(psmGetChargerType(&charger)) && charger == PsmChargerType_EnoughPower) {
-        snprintf(current_mode, sizeof(current_mode), "Docked");
-    }
     else {
-        snprintf(current_mode, sizeof(current_mode), "Handheld");
+        bool docked=false;
+        snprintf(current_mode,sizeof(current_mode),"%s",ext_docked(&docked)?(docked?"Docked":"Handheld"):"unknown");
     }
 
     publish_if_changed(fd, config, snapshot, force, "operation_mode",
@@ -1131,20 +1145,25 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
         publish_if_changed(fd, config, snapshot, force, "sd_used_space", snapshot->sd_used, sizeof(snapshot->sd_used), size_val);
     }
 
+    extended_poll(state, fd, config);
     snapshot->initialized = true;
 }
 
 static void publish_state(AppState *state, int fd, const AppConfig *config, const char *status) {
-    char topic[SHA_MAX_TOPIC + 32];
-    char payload[256];
-    snprintf(topic, sizeof(topic), "%s/status", config->mqtt_topic_prefix);
+    char topic[192];
+    char payload[900],device_name[400],client_id[400];
+    ext_escape(config->device_name,device_name,sizeof(device_name));
+    ext_escape(client_id_or_device(config),client_id,sizeof(client_id));
+    state_topic(config,"status",topic,sizeof(topic));
     snprintf(payload, sizeof(payload),
              "{\"device\":\"%s\",\"client_id\":\"%s\",\"status\":\"%s\",\"ha_validated\":%s}",
-             config->device_name,
-             config->mqtt_client_id[0] ? config->mqtt_client_id : config->device_name,
+             device_name,
+             client_id,
              status,
              state->ha_validated ? "true" : "false");
     mqtt_send_publish(fd, topic, payload, true);
+    state_topic(config, "availability", topic, sizeof(topic));
+    mqtt_send_publish(fd, topic, status, true);
 }
 
 static bool read_mqtt_remaining_length(const unsigned char *buffer, int size, int *value, int *bytes_used) {
@@ -1166,12 +1185,14 @@ static bool read_mqtt_remaining_length(const unsigned char *buffer, int size, in
     return false;
 }
 
+#include "mqtt_extensions.inc"
+
 static void handle_command_payload(AppState *state, int fd, const AppConfig *config, const char *payload) {
     if (!payload || payload[0] == '\0') {
         return;
     }
 
-    app_state_push_log(state, "MQTT command: %s", payload);
+    if (extended_command(state, fd, config, "command", payload)) return;
 
     if (strcasecmp(payload, "reboot") == 0) {
         if (!state->svc_spsm_ready) {
@@ -1179,18 +1200,18 @@ static void handle_command_payload(AppState *state, int fd, const AppConfig *con
             return;
         }
         app_state_push_log(state, "Reboot command accepted");
-        spsmShutdown(true);
+        ext_result(fd,config,"reboot",spsmShutdown(true));
     } else if (strcasecmp(payload, "shutdown") == 0 || strcasecmp(payload, "poweroff") == 0) {
         if (!state->svc_spsm_ready) {
             app_state_push_log(state, "Shutdown unavailable: spsm not ready");
             return;
         }
         app_state_push_log(state, "Shutdown command accepted");
-        spsmShutdown(false);
+        ext_result(fd,config,"shutdown",spsmShutdown(false));
     } else if (strcasecmp(payload, "sleep") == 0 || strcasecmp(payload, "standby") == 0) {
-        app_state_push_log(state, "Sleep command removed: unsupported in sysmodule");
+        extended_command(state,fd,config,"sleep","PRESS");
     } else {
-        app_state_push_log(state, "Unknown MQTT command");
+        ext_result(fd,config,"unknown",MAKERESULT(Module_Libnx,LibnxError_BadInput));
     }
 }
 
@@ -1262,19 +1283,25 @@ static void handle_mqtt_publish(AppState *state, int fd, const AppConfig *config
     pos += topic_len;
 
     int qos = (buffer[0] & 0x06) >> 1;
-    if (qos > 0) {
+    if (qos == 1) {
+        if (pos + 2 > size) return;
+        unsigned char ack[] = {0x40, 2, buffer[pos], buffer[pos+1]};
+        mqtt_send_packet(fd, ack, sizeof(ack));
         pos += 2;
-    }
+    } else if (qos > 1) { return; }
+    if (buffer[0] & 1) return; /* Never execute retained commands. */
     if (pos > size) {
         return;
     }
 
-    int payload_len = size - pos;
+    int packet_end = 1 + remaining_bytes + remaining;
+    if (packet_end > size) return;
+    int payload_len = packet_end - pos;
     if (payload_len <= 0) {
         return;
     }
     if (payload_len >= NOTIFY_TEXT_MAX) {
-        payload_len = NOTIFY_TEXT_MAX - 1;
+        return; /* Reject oversized commands rather than executing truncated input. */
     }
 
     char payload[NOTIFY_TEXT_MAX];
@@ -1283,10 +1310,14 @@ static void handle_mqtt_publish(AppState *state, int fd, const AppConfig *config
 
     char command_topic[SHA_MAX_TOPIC + 32];
     char popup_topic[192];
-    snprintf(command_topic, sizeof(command_topic), "%s/command", config->mqtt_topic_prefix);
+    state_topic(config, "command", command_topic, sizeof(command_topic));
     notification_topic(config, "popup", popup_topic, sizeof(popup_topic));
 
-    if (strcmp(topic, command_topic) == 0) {
+    char control_prefix[192];
+    state_topic(config, "control/", control_prefix, sizeof(control_prefix));
+    if (strncmp(topic, control_prefix, strlen(control_prefix)) == 0) {
+        extended_command(state, fd, config, topic + strlen(control_prefix), payload);
+    } else if (strcmp(topic, command_topic) == 0) {
         handle_command_payload(state, fd, config, payload);
     } else if (strcmp(topic, popup_topic) == 0) {
         handle_notification_payload(state, fd, config, topic, payload);
@@ -1294,6 +1325,7 @@ static void handle_mqtt_publish(AppState *state, int fd, const AppConfig *config
 }
 
 static void mqtt_loop(void *arg) {
+    bool sm_ready=R_SUCCEEDED(smInitialize());
     AppState *state = arg;
     u64 last_sensor_poll_ms = 0;
     u64 last_heartbeat_ms = 0;
@@ -1305,9 +1337,6 @@ static void mqtt_loop(void *arg) {
         bool power_sleeping = state->power_sleeping;
         bool dns_ok = state->mqtt_dns_ok;
         AppConfig config = state->config;
-        char prefix[SHA_MAX_TOPIC];
-        strncpy(prefix, state->config.mqtt_topic_prefix, sizeof(prefix) - 1);
-        prefix[sizeof(prefix) - 1] = '\0';
         mutexUnlock(&state->lock);
 
         char host[SHA_MAX_FIELD];
@@ -1324,7 +1353,7 @@ static void mqtt_loop(void *arg) {
             continue;
         }
 
-        if (host[0] == '\0' || prefix[0] == '\0') {
+        if (host[0] == '\0' || config.mqtt_topic_prefix[0] == '\0') {
             mqtt_set_status(state, false, false, false, "MQTT incomplete config");
             svcSleepThread(1000 * 1000 * 1000ULL);
             continue;
@@ -1381,7 +1410,10 @@ static void mqtt_loop(void *arg) {
         }
 
         char command_topic[SHA_MAX_TOPIC + 32];
-        snprintf(command_topic, sizeof(command_topic), "%s/command", prefix);
+        state_topic(&config, "command", command_topic, sizeof(command_topic));
+        char controls_topic[192];
+        state_topic(&config, "control/+", controls_topic, sizeof(controls_topic));
+        mqtt_send_subscribe(fd, controls_topic);
         mqtt_send_subscribe(fd, command_topic);
         if (config.notification_overlay_enabled) {
             char popup_topic[192];
@@ -1412,7 +1444,7 @@ static void mqtt_loop(void *arg) {
             }
             if (poll_rc > 0 && (pfd.revents & POLLIN)) {
                 unsigned char buffer[MQTT_BUFFER];
-                int size = recv(fd, buffer, sizeof(buffer), 0);
+                int size=mqtt_read_frame(fd,buffer,sizeof(buffer),socket_recv_all);
                 if (size <= 0) {
                     break;
                 }
@@ -1456,10 +1488,7 @@ static void mqtt_loop(void *arg) {
             }
         }
 
-        if (!power_sleeping) {
-            publish_state(state, fd, &config, "offline");
-            publish_value(fd, &config, "operation_mode", "Sleep");
-        }
+        publish_state(state, fd, &config, "offline");
         close(fd);
         g_ctx.socket_fd = -1;
         mutexLock(&state->lock);
@@ -1471,6 +1500,10 @@ static void mqtt_loop(void *arg) {
             app_state_push_log(state, "MQTT disconnected");
         }
     }
+    if(ext_ts) {tsExit();ext_ts=false;}
+    if(ext_nifm) {nifmExit();ext_nifm=false;}
+    serviceClose(&ext_omm_service);
+    if(sm_ready) smExit();
 }
 
 bool mqtt_service_start(AppState *state) {

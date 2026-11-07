@@ -31,6 +31,8 @@ static bool g_graphics_ready = false;
 static bool g_fs_ready = false;
 static bool g_sdmc_ready = false;
 static bool g_sm_ready = false;
+static bool g_hid_ready = false;
+static PadState g_pad;
 
 static void exit_graphics(void);
 static void append_log(const char *message, Result rc);
@@ -69,6 +71,11 @@ void __appInit(void) {
         fatalThrow(rc);
     }
     g_sdmc_ready = true;
+    g_hid_ready = R_SUCCEEDED(hidInitialize());
+    if(g_hid_ready) {
+        padConfigureInput(1,HidNpadStyleSet_NpadStandard);
+        padInitializeDefault(&g_pad);
+    }
 
 }
 
@@ -82,6 +89,7 @@ void __appExit(void) {
     if (g_fs_ready) {
         fsExit();
     }
+    if(g_hid_ready) hidExit();
     if (g_sm_ready) {
         smExit();
     }
@@ -554,6 +562,30 @@ static void render_notification(const Notification *notification, u64 started_ms
     framebufferEnd(&g_framebuffer);
 }
 
+/* Optional four-slot action menu. Actions are routed through MQTT automations. */
+static char quick_names[4][64];
+static void load_quick_actions(void) {
+    for(int i=0;i<4;i++)snprintf(quick_names[i],64,"Action %d",i+1);
+    FILE*f=fopen("sdmc:/switch/switch-ha/quick-actions.ini","r");
+    if(!f)return;
+    char line[100];int slot;
+    while(fgets(line,sizeof(line),f)) {
+        if(sscanf(line,"%d=",&slot)==1 && slot>=1 && slot<=4) {
+            char*eq=strchr(line,'=');if(!eq)continue;
+            eq++;eq[strcspn(eq,"\r\n")]=0;
+            snprintf(quick_names[slot-1],64,"%.63s",eq);
+        }
+    }
+    fclose(f);
+}
+static void queue_quick_action(int slot) {
+    const char*temp="sdmc:/switch/switch-ha/overlay-command.tmp";
+    FILE*f=fopen(temp,"w");
+    if(!f)return;
+    fprintf(f,"quick_action_%d\n",slot+1);
+    if(fclose(f)==0)rename(temp,"sdmc:/switch/switch-ha/overlay-command.ini");
+}
+
 int main(int argc, char **argv) {
     (void) argc;
     (void) argv;
@@ -572,12 +604,34 @@ int main(int argc, char **argv) {
         }
     }
 
+    load_quick_actions();
+    bool menu=false; int selected=0;
     char last_id[32] = {0};
     Notification active = {0};
     bool showing = false;
     u64 show_started_ms = 0;
 
     while (true) {
+        if(g_hid_ready) {
+            padUpdate(&g_pad);
+            u64 held=padGetButtons(&g_pad),down=padGetButtonsDown(&g_pad);
+            u64 combo=HidNpadButton_ZL|HidNpadButton_ZR;
+            if((held&combo)==combo && (down&HidNpadButton_Minus)) {menu=!menu;showing=false;}
+            if(menu) {
+                if(down&HidNpadButton_Up)selected=(selected+3)%4;
+                if(down&HidNpadButton_Down)selected=(selected+1)%4;
+                if(down&HidNpadButton_B){menu=false;clear_frame();}
+                if(down&HidNpadButton_A){queue_quick_action(selected);menu=false;clear_frame();}
+            }
+        }
+        if(menu) {
+            Notification action={0};
+            snprintf(action.title,sizeof(action.title),"HA: %s",quick_names[selected]);
+            snprintf(action.message,sizeof(action.message),"Up/Down: select  A: run  B: close (%d/4)",selected+1);
+            render_notification(&action,0);
+            svcSleepThread(50ULL*1000*1000);
+            continue;
+        }
         Notification current;
         if (read_notification(&current) && strcmp(current.id, last_id) != 0) {
             active = current;

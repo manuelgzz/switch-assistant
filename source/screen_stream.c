@@ -46,6 +46,7 @@ static Thread g_server_thread = {0};
 static Thread g_video_thread = {0};
 static atomic_bool g_running = false;
 static atomic_bool g_paused = false;
+static atomic_bool g_enabled = true;
 static atomic_bool g_listener_ready = false;
 static atomic_bool g_client_connected = false;
 static atomic_bool g_client_streaming = false;
@@ -572,7 +573,7 @@ static void server_thread_main(void *arg) {
         mutexUnlock(&g_client_lock);
         g_listener_ready = true;
         while (g_running) {
-            if (g_paused) {
+            if (g_paused || !g_enabled) {
                 break;
             }
             struct pollfd pfd = { .fd = listener, .events = POLLIN };
@@ -606,7 +607,7 @@ static void server_thread_main(void *arg) {
                 size_t used = 0;
 
                 while (g_running && g_client_connected) {
-                    if (g_paused) {
+                    if (g_paused || !g_enabled) {
                         break;
                     }
                     struct pollfd client_pfd = { .fd = client, .events = POLLIN };
@@ -673,7 +674,7 @@ static void video_thread_main(void *arg) {
     (void) arg;
 
     while (g_running) {
-        while (g_running && (!g_client_streaming || g_paused)) {
+        while (g_running && (!g_client_streaming || g_paused || !g_enabled)) {
             svcSleepThread(100ULL * 1000ULL * 1000ULL);
         }
         if (!g_running) {
@@ -682,7 +683,7 @@ static void video_thread_main(void *arg) {
 
         u64 first_ts = 0;
         while (g_running && g_client_streaming) {
-            if (g_paused) {
+            if (g_paused || !g_enabled) {
                 g_client_streaming = false;
                 break;
             }
@@ -770,7 +771,7 @@ void screen_stream_get_status(char *out, size_t out_size) {
 
     if (R_FAILED(g_grcd_open_result)) {
         value = "grcd_failed";
-    } else if (g_paused) {
+    } else if (g_paused || !g_enabled) {
         value = "paused";
     } else if (g_client_streaming) {
         value = "streaming";
@@ -792,3 +793,7 @@ Result screen_stream_get_grcd_open_result(void) {
 Result screen_stream_get_grcd_begin_result(void) {
     return g_grcd_begin_result;
 }
+
+void screen_stream_set_enabled(bool enabled) { g_enabled=enabled; }
+bool screen_stream_is_enabled(void) { return g_enabled; }
+unsigned screen_stream_client_count(void) { return g_client_connected ? 1 : 0; }

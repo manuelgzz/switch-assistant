@@ -313,6 +313,19 @@ startup_delay_seconds=30
 
 The default is `0`, which keeps startup immediate on standard Atmosphere setups.
 
+## Extended Home Assistant Controls
+
+This fork adds per-device MQTT commands, brightness/backlight/volume controls,
+diagnostics, additional telemetry, installed-game selectors, and overlay quick actions.
+See [controls, setup, migration and hardware validation](docs/home-assistant-controls.md).
+
+## Download Development Builds
+
+Every push to a branch builds the NRO in [GitHub Actions](../../actions/workflows/release.yml).
+Open the completed run and download the `switch-ha-<commit>` ZIP under **Artifacts**,
+then extract `switch-ha.nro`. GitHub requires signing in to download Actions artifacts;
+they are retained for 30 days. Tagged releases continue to publish an NRO release asset.
+
 ## Build From Source
 
 Requirement:
