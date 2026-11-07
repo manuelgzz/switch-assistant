@@ -22,6 +22,7 @@
 #define MQTT_HEARTBEAT_INTERVAL_MS 15000
 #define SWITCH_HA_ENABLE_SYSTEM_SENSORS 1
 #define MAX_PLAYERS 8
+#define SYSTEM_METRICS_INTERVAL_MS 30000
 #define NOTIFY_TEXT_MAX 512
 #define NOTIFICATION_CURRENT_PATH "sdmc:/switch/switch-ha/notification-current.ini"
 #define NOTIFICATION_LOG_PATH "sdmc:/switch/switch-ha/notifications.log"
@@ -48,6 +49,18 @@ typedef struct {
     char operation_mode[16];
     char sd_free[16];
     char sd_used[16];
+    char docked[8];
+    char player_wired[MAX_PLAYERS][8];
+    char soc_temperature[16];
+    char uptime[24];
+    char wifi_strength[16];
+    char sd_total[16];
+    char internal_free[24];
+    char internal_total[24];
+    char memory_used[24];
+    char diagnostics[16];
+    u64 last_system_metrics_ms;
+    bool games_published;
 } SensorSnapshot;
 
 typedef struct {
@@ -57,6 +70,16 @@ typedef struct {
 } MqttContext;
 
 static MqttContext g_ctx = {0};
+
+static const struct {
+    const char *id;
+    const char *name;
+    int min_players;
+} multiplayer_sensors[] = {
+    {"games_2p", "2-Player Games", 2},
+    {"games_4p", "4-Player Games", 4},
+    {"games_8p", "8+ Player Games", 8},
+};
 
 static void sanitize_id(const char *input, char *output, size_t output_size);
 static const char *client_id_or_device(const AppConfig *config);
@@ -778,8 +801,9 @@ static void discovery_topic(const AppConfig *config, const char *component, cons
     snprintf(topic, topic_size, "%s/%s/%s/%s/config", config->mqtt_topic_prefix, component, safe_id, sensor);
 }
 
-static void publish_discovery_sensor(int fd, const AppConfig *config, const char *component, const char *sensor,
-                                     const char *name, const char *device_class, const char *unit, const char *state_class) {
+static void publish_discovery_sensor_full(int fd, const AppConfig *config, const char *component, const char *sensor,
+                                     const char *name, const char *device_class, const char *unit,
+                                     const char *state_class, bool diagnostic, bool attributes) {
     char topic[256];
     char state[192];
     char payload[MQTT_BUFFER];
@@ -817,7 +841,25 @@ static void publish_discovery_sensor(int fd, const AppConfig *config, const char
         }
     }
 
+    if (diagnostic || attributes) {
+        size_t len = strlen(payload) - 1;
+        payload[len] = '\0';
+        if (diagnostic) {
+            len += snprintf(payload + len, sizeof(payload) - len, ",\"ent_cat\":\"diagnostic\"");
+        }
+        if (attributes) {
+            snprintf(payload + len, sizeof(payload) - len, ",\"json_attr_t\":\"%s/attributes\"}", state);
+        } else {
+            snprintf(payload + len, sizeof(payload) - len, "}");
+        }
+    }
+
     mqtt_send_publish(fd, topic, payload, true);
+}
+
+static void publish_discovery_sensor(int fd, const AppConfig *config, const char *component, const char *sensor,
+                                     const char *name, const char *device_class, const char *unit, const char *state_class) {
+    publish_discovery_sensor_full(fd, config, component, sensor, name, device_class, unit, state_class, false, false);
 }
 
 static void publish_discovery_button(int fd, const AppConfig *config, const char *button, const char *name, const char *payload_press) {
@@ -892,6 +934,26 @@ static void publish_sensor_discovery(AppState *state, int fd, const AppConfig *c
     publish_discovery_sensor(fd, config, "sensor", "sd_free_space", "SD Free Space", NULL, "GB", "measurement");
     publish_discovery_sensor(fd, config, "sensor", "sd_used_space", "SD Used Space", NULL, "GB", "measurement");
 
+    if (state->app_mode == AppMode_Sysmodule) {
+        publish_discovery_sensor(fd, config, "binary_sensor", "docked", "Docked", "plug", NULL, NULL);
+        publish_discovery_sensor_full(fd, config, "sensor", "uptime", "Uptime", "duration", "s", "total_increasing", true, false);
+        publish_discovery_sensor_full(fd, config, "sensor", "sd_total", "SD Card Total Space", "data_size", "GiB", "measurement", true, false);
+        publish_discovery_sensor_full(fd, config, "sensor", "internal_free", "Internal Storage Free Space", "data_size", "MiB", "measurement", true, false);
+        publish_discovery_sensor_full(fd, config, "sensor", "internal_total", "Internal Storage Total Space", "data_size", "MiB", "measurement", true, false);
+        publish_discovery_sensor_full(fd, config, "sensor", "memory_used", "Switch Assistant RAM Used", "data_size", "MiB", "measurement", true, false);
+        publish_discovery_sensor_full(fd, config, "sensor", "diagnostics", "Diagnostics", NULL, NULL, NULL, true, true);
+        if (state->svc_ts_ready) {
+            publish_discovery_sensor_full(fd, config, "sensor", "soc_temperature", "SoC Temperature", "temperature", "°C", "measurement", true, false);
+        }
+        if (state->svc_nifm_ready) {
+            publish_discovery_sensor_full(fd, config, "sensor", "wifi_strength", "Wi-Fi Signal Strength", NULL, NULL, "measurement", true, false);
+        }
+        for (size_t i = 0; i < sizeof(multiplayer_sensors) / sizeof(multiplayer_sensors[0]); ++i) {
+            publish_discovery_sensor_full(fd, config, "sensor", multiplayer_sensors[i].id,
+                                          multiplayer_sensors[i].name, NULL, NULL, "measurement", false, true);
+        }
+    }
+
     if (state->svc_audctl_ready) {
         publish_discovery_sensor(fd, config, "sensor", "volume", "Volume", NULL, "%", "measurement");
         publish_discovery_sensor(fd, config, "sensor", "audio_target", "Audio Output Target", NULL, NULL, NULL);
@@ -909,6 +971,9 @@ static void publish_sensor_discovery(AppState *state, int fd, const AppConfig *c
             snprintf(sensor, sizeof(sensor), "player_%d_controller", i + 1);
             snprintf(name, sizeof(name), "Player %d Controller", i + 1);
             publish_discovery_sensor(fd, config, "sensor", sensor, name, NULL, NULL, NULL);
+            snprintf(sensor, sizeof(sensor), "player_%d_wired", i + 1);
+            snprintf(name, sizeof(name), "Player %d Controller Wired", i + 1);
+            publish_discovery_sensor_full(fd, config, "binary_sensor", sensor, name, "plug", NULL, NULL, true, false);
         }
     }
     if (state->svc_spsm_ready) {
@@ -949,6 +1014,109 @@ static void publish_if_changed(int fd, const AppConfig *config, SensorSnapshot *
     }
 }
 
+static void publish_attributes(int fd, const AppConfig *config, const char *sensor, const char *json) {
+    char topic[224];
+    state_topic(config, sensor, topic, sizeof(topic) - sizeof("/attributes") + 1);
+    strcat(topic, "/attributes");
+    mqtt_send_publish(fd, topic, json, true);
+}
+
+static bool read_soc_temperature(float *temperature) {
+    if (hosversionGet() == 0 || hosversionAtLeast(10, 0, 0)) {
+        TsSession session;
+        if (R_SUCCEEDED(tsOpenSession(&session, TsDeviceCode_LocationExternal))) {
+            Result rc = tsSessionGetTemperature(&session, temperature);
+            tsSessionClose(&session);
+            if (R_SUCCEEDED(rc)) return true;
+        }
+    }
+
+    s32 milli_celsius;
+    if (R_SUCCEEDED(tsGetTemperatureMilliC(TsLocation_External, &milli_celsius))) {
+        *temperature = (float)milli_celsius / 1000.0f;
+        return true;
+    }
+
+    s32 celsius;
+    if (R_SUCCEEDED(tsGetTemperature(TsLocation_External, &celsius))) {
+        *temperature = (float)celsius;
+        return true;
+    }
+    return false;
+}
+
+static void publish_system_metrics(AppState *state, int fd, const AppConfig *config,
+                                   SensorSnapshot *snapshot, bool force, bool game_inventory_ready) {
+    char value[32];
+    u64 now = monotonic_ms();
+    if (force || now - snapshot->last_system_metrics_ms >= SYSTEM_METRICS_INTERVAL_MS) {
+        snapshot->last_system_metrics_ms = now;
+        snprintf(value, sizeof(value), "%llu", (unsigned long long)(now / 1000));
+        publish_if_changed(fd, config, snapshot, force, "uptime", snapshot->uptime, sizeof(snapshot->uptime), value);
+        float temperature;
+        if (state->svc_ts_ready && read_soc_temperature(&temperature)) {
+            snprintf(value, sizeof(value), "%.1f", (double)temperature);
+            publish_if_changed(fd, config, snapshot, force, "soc_temperature", snapshot->soc_temperature, sizeof(snapshot->soc_temperature), value);
+        }
+
+        if (state->svc_nifm_ready) {
+            NifmInternetConnectionType type;
+            u32 bars;
+            if (R_SUCCEEDED(nifmGetInternetConnectionStatus(&type, &bars, NULL)) && type == NifmInternetConnectionType_WiFi) {
+                snprintf(value, sizeof(value), "%u", bars);
+            } else {
+                snprintf(value, sizeof(value), "None");
+            }
+            publish_if_changed(fd, config, snapshot, force, "wifi_strength", snapshot->wifi_strength, sizeof(snapshot->wifi_strength), value);
+        }
+
+        FsFileSystem user_fs;
+        if (R_SUCCEEDED(fsOpenBisFileSystem(&user_fs, FsBisPartitionId_User, ""))) {
+            s64 bytes;
+            if (R_SUCCEEDED(fsFsGetFreeSpace(&user_fs, "/", &bytes))) {
+                snprintf(value, sizeof(value), "%lld", (long long)(bytes / (1024 * 1024)));
+                publish_if_changed(fd, config, snapshot, force, "internal_free", snapshot->internal_free, sizeof(snapshot->internal_free), value);
+            }
+            if (R_SUCCEEDED(fsFsGetTotalSpace(&user_fs, "/", &bytes))) {
+                snprintf(value, sizeof(value), "%lld", (long long)(bytes / (1024 * 1024)));
+                publish_if_changed(fd, config, snapshot, force, "internal_total", snapshot->internal_total, sizeof(snapshot->internal_total), value);
+            }
+            fsFsClose(&user_fs);
+        }
+
+        u64 bytes;
+        if (R_SUCCEEDED(svcGetInfo(&bytes, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0))) {
+            snprintf(value, sizeof(value), "%.2f", (double)bytes / (1024.0 * 1024.0));
+            publish_if_changed(fd, config, snapshot, force, "memory_used", snapshot->memory_used, sizeof(snapshot->memory_used), value);
+        }
+
+        const bool healthy = state->svc_hid_ready && state->svc_ts_ready && state->svc_nifm_ready && game_inventory_ready;
+        publish_if_changed(fd, config, snapshot, force, "diagnostics", snapshot->diagnostics, sizeof(snapshot->diagnostics),
+                           healthy ? "healthy" : "warning");
+        char attributes[256];
+        snprintf(attributes, sizeof(attributes),
+                 "{\"uptime_s\":%llu,\"controller_service\":%s,\"temperature_service\":%s,"
+                 "\"network_service\":%s,\"game_inventory_ready\":%s}",
+                 (unsigned long long)(now / 1000), state->svc_hid_ready ? "true" : "false",
+                 state->svc_ts_ready ? "true" : "false", state->svc_nifm_ready ? "true" : "false",
+                 game_inventory_ready ? "true" : "false");
+        publish_attributes(fd, config, "diagnostics", attributes);
+    }
+
+    if (game_inventory_ready && !snapshot->games_published) {
+        char *attributes = malloc(66000);
+        if (!attributes) return;
+        for (size_t i = 0; i < sizeof(multiplayer_sensors) / sizeof(multiplayer_sensors[0]); ++i) {
+            const size_t count = title_cache_build_games_attr(attributes, 66000, multiplayer_sensors[i].min_players);
+            snprintf(value, sizeof(value), "%zu", count);
+            publish_value(fd, config, multiplayer_sensors[i].id, value);
+            publish_attributes(fd, config, multiplayer_sensors[i].id, attributes);
+        }
+        free(attributes);
+        snapshot->games_published = true;
+    }
+}
+
 static void publish_switch_sensors(AppState *state, int fd, const AppConfig *config, SensorSnapshot *snapshot, bool force) {
     char value[64];
     u32 percent = 0;
@@ -956,6 +1124,7 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     PsmBatteryChargeInfoFields info = {0};
     mutexLock(&state->lock);
     bool power_sleeping = state->power_sleeping;
+    bool game_inventory_ready = state->game_inventory_ready;
     mutexUnlock(&state->lock);
 
     if (R_SUCCEEDED(psmGetBatteryChargePercentage(&percent))) {
@@ -1058,6 +1227,8 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     if (state->svc_hid_ready) {
         int player_controller_count = 0;
         char player_values[MAX_PLAYERS][32];
+        bool player_wired[MAX_PLAYERS] = {false};
+        const u32 wired_mask = HidNpadAttribute_IsWired | HidNpadAttribute_IsLeftWired | HidNpadAttribute_IsRightWired;
 
         for (int i = 0; i < MAX_PLAYERS; ++i) {
             snprintf(player_values[i], sizeof(player_values[i]), "none");
@@ -1071,6 +1242,7 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
             }
 
             player_controller_count++;
+            player_wired[i] = (attributes & wired_mask) != 0;
             controller_value(player_values[i], sizeof(player_values[i]), style);
         }
 
@@ -1079,6 +1251,7 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
             u32 attributes = 0;
             if (style != 0 && npad_has_state(HidNpadIdType_Handheld, style, &attributes)) {
                 player_controller_count = 1;
+                player_wired[0] = (attributes & wired_mask) != 0;
                 controller_value(player_values[0], sizeof(player_values[0]), style);
             }
         }
@@ -1089,6 +1262,9 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
             char sensor[32];
             snprintf(sensor, sizeof(sensor), "player_%d_controller", i + 1);
             publish_if_changed(fd, config, snapshot, force, sensor, snapshot->player_controller[i], sizeof(snapshot->player_controller[i]), player_values[i]);
+            snprintf(sensor, sizeof(sensor), "player_%d_wired", i + 1);
+            publish_if_changed(fd, config, snapshot, force, sensor, snapshot->player_wired[i],
+                               sizeof(snapshot->player_wired[i]), player_wired[i] ? "ON" : "OFF");
         }
     }
 
@@ -1100,10 +1276,11 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     }
 
     char current_mode[16];
+    const bool docked = R_SUCCEEDED(psmGetChargerType(&charger)) && charger == PsmChargerType_EnoughPower;
     if (power_sleeping) {
         snprintf(current_mode, sizeof(current_mode), "Sleep");
     }
-    else if (R_SUCCEEDED(psmGetChargerType(&charger)) && charger == PsmChargerType_EnoughPower) {
+    else if (docked) {
         snprintf(current_mode, sizeof(current_mode), "Docked");
     }
     else {
@@ -1113,6 +1290,11 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     publish_if_changed(fd, config, snapshot, force, "operation_mode",
         snapshot->operation_mode, sizeof(snapshot->operation_mode), current_mode);
 
+    if (state->app_mode == AppMode_Sysmodule) {
+        publish_if_changed(fd, config, snapshot, force, "docked", snapshot->docked, sizeof(snapshot->docked), docked ? "ON" : "OFF");
+        publish_system_metrics(state, fd, config, snapshot, force, game_inventory_ready);
+    }
+
     struct statvfs vfs;
     char size_val[32];
 
@@ -1120,6 +1302,11 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
         u64 total_bytes_sd = (u64)vfs.f_blocks * (u64)vfs.f_frsize;
         u64 free_bytes_sd = (u64)vfs.f_bavail * (u64)vfs.f_frsize;
         u64 used_bytes_sd = (total_bytes_sd > free_bytes_sd) ? (total_bytes_sd - free_bytes_sd) : 0;
+
+        if (state->app_mode == AppMode_Sysmodule) {
+            snprintf(size_val, sizeof(size_val), "%.2f", (double)total_bytes_sd / (1024.0 * 1024.0 * 1024.0));
+            publish_if_changed(fd, config, snapshot, force, "sd_total", snapshot->sd_total, sizeof(snapshot->sd_total), size_val);
+        }
 
         double free_sd_gb = (double)free_bytes_sd / (1024.0 * 1024.0 * 1024.0);
         double used_sd_gb = (double)used_bytes_sd / (1024.0 * 1024.0 * 1024.0);

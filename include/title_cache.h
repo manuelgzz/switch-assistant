@@ -8,3 +8,6 @@
 #define TITLE_INDEX_PATH "sdmc:/switch/switch-ha/titles.idx"
 
 bool title_cache_lookup(u64 application_id, char *out, size_t out_size);
+
+bool title_cache_refresh_installed_games(void);
+size_t title_cache_build_games_attr(char *out, size_t out_size, int min_players);

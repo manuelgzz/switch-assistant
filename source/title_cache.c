@@ -1,5 +1,8 @@
 #include "title_cache.h"
 
+#include <switch/services/ns.h>
+#include <switch/nacp.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,4 +170,275 @@ bool title_cache_lookup(u64 application_id, char *out, size_t out_size) {
     }
 
     return read_title_name_at_offset(entry->offset, out, out_size) && g_cached_application_id == application_id;
+}
+
+/* Multiplayer metadata and installed-title enumeration adapted from FaserF/switch-assistant. */
+#define MAX_INSTALLED_GAMES 256
+
+typedef struct {
+    u64 application_id;
+    char name[128];
+    int max_players;
+} InstalledGame;
+
+static InstalledGame g_installed_games[MAX_INSTALLED_GAMES];
+static size_t g_installed_game_count;
+
+static const char *case_str_search(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (needle[0] == '\0') return haystack;
+    size_t needle_len = strlen(needle);
+    for (size_t i = 0; haystack[i]; ++i) {
+        if (strncasecmp(haystack + i, needle, needle_len) == 0) {
+            return haystack + i;
+        }
+    }
+    return NULL;
+}
+
+static int title_cache_get_max_players(u64 application_id, const char *name) {
+    FILE *override = fopen("sdmc:/switch/switch-ha/players.ini", "r");
+    if (!override) {
+        override = fopen("sdmc:/switch/switch-ha/players.txt", "r");
+    }
+    if (override) {
+        char line[256];
+        while (fgets(line, sizeof(line), override)) {
+            trim_line(line);
+            char *sep = strchr(line, '=');
+            if (!sep) sep = strchr(line, ';');
+            if (!sep || sep == line) continue;
+            *sep = '\0';
+            const char *key = line;
+            const char *val = sep + 1;
+            u64 parsed_id = 0;
+            if (parse_title_id(key, &parsed_id) && parsed_id == application_id) {
+                int p = atoi(val);
+                if (p > 0) {
+                    fclose(override);
+                    return p;
+                }
+            }
+            if (name && (strcasecmp(key, name) == 0 || case_str_search(name, key) != NULL)) {
+                int p = atoi(val);
+                if (p > 0) {
+                    fclose(override);
+                    return p;
+                }
+            }
+        }
+        fclose(override);
+    }
+
+    if (!name || name[0] == '\0') {
+        return 1;
+    }
+
+    const char *games_8p[] = {
+        "Smash Bros", "Super Smash", "Bomberman", "Super Bomberman", "1-2-Switch",
+        "1-2 Switch", "Everybody 1-2", "Runbow", "Knight Squad", "Killer Queen",
+        "TowerFall", "Tower Fall", "Pico Park", "PicoPark", "WarioWare", "Gang Beasts", "Just Dance",
+        "Virtua Tennis", "Mario Strikers", "Super Mario Strikers", "Death Squared",
+        "Aeolis Tournament", "Bulanci", "Rover Wars", "Sky Gamblers", "Splatoon",
+        "Shredder's Revenge", "Party Golf", "ClusterPuck", "8 Player", "8-Player", "8 Players",
+        "Super Bomberman R", "Luigi's Mansion 3", "Super Smash Bros. Ultimate", "Runbow Deluxe"
+    };
+    for (size_t i = 0; i < sizeof(games_8p) / sizeof(games_8p[0]); ++i) {
+        if (case_str_search(name, games_8p[i]) != NULL) {
+            return 8;
+        }
+    }
+
+    const char *games_4p[] = {
+        "Mario Party", "Mario Tennis", "Mario Golf", "Mario Kart", "Overcooked",
+        "Moving Out", "Castle Crashers", "TMNT", "Teenage Mutant", "Streets of Rage",
+        "Brawlhalla", "Rocket League", "Minecraft", "Rayman", "Borderlands",
+        "Diablo", "Sonic", "FIFA", "EA SPORTS", "FC 24", "FC 25", "NBA",
+        "WWE", "NFL", "Jackbox", "Stick Fight", "Boomerang Fu", "Worms", "SpeedRunners",
+        "Ultimate Chicken", "Trine", "Heave Ho", "Hidden in Plain", "Lego",
+        "Monopoly", "Uno", "Trivial Pursuit", "Carnival Games", "Switch Sports",
+        "Nintendo Switch Sports", "Party", "Strikers", "Super Mario 3D World",
+        "Kirby Star Allies", "Kirby", "Brawl", "SpongeBob", "Flat Heroes",
+        "Rubber Bandits", "Spelunky", "Risk of Rain", "Lovers in a Dangerous",
+        "Animal Bomber", "NUMAN ATHLETICS", "THE TIN STAR", "Black and White Bushido",
+        "BOMBFEST", "Chalk Dash Carnival", "Chapeau", "Circuit Superstars",
+        "Cube Creator X", "Doggie Ninja", "FUN! FUN! Animal Park", "Horizon Chase",
+        "HYPERCHARGE", "Inspector Gadget", "Jamestown", "JDM Racing", "Jujutsu Kaisen",
+        "Moorhuhn Kart", "MY HERO ONE'S JUSTICE", "NBA Playgrounds", "NCL: USA Bowl",
+        "Pixel Family Fun", "Pocket Mini Golf", "Professor Rubik", "Road to Ballhalla",
+        "Run Box Run", "Simple Mini Golf", "Slots of Poker", "Super Korotama",
+        "Super Tennis Blast", "SuperDuck", "Them Bombs", "Theme Park Jam",
+        "This Means Warp", "Tokyo Cooking", "Unruly Heroes", "Wild Card Football",
+        "Winter Sports Games", "Wizards Tourney", "Worlds of Magic", "Broforce",
+        "Tools Up", "Conduct Together", "Unrailed", "For the King", "Magicka",
+        "Nine Parchments", "Full Metal Furies", "Gauntlet", "Marvel Ultimate Alliance",
+        "Cat Quest", "River City", "Scott Pilgrim", "Capcom Beat", "Alien Hominid",
+        "Crawl", "Screencheat", "Astro Bears", "Timberman", "Duck Game", "Nidhogg",
+        "Lethal League", "Marooners", "Party Panic", "Cake Bash", "Air Hockey",
+        "Mini Golf", "Bowling", "Darts", "Billiards", "3 Card Poker", "Kart",
+        "4 Player", "4-Player", "4 Players", "Olympic Games", "Formula Racing",
+        "Street Fighter 30th", "Astro Bot", "TowerFall Ascension", "Puyo Puyo",
+        "Tetris Effect", "Super Monkey Ball", "Golf With Your Friends", "Death Road to Canada"
+    };
+    for (size_t i = 0; i < sizeof(games_4p) / sizeof(games_4p[0]); ++i) {
+        if (case_str_search(name, games_4p[i]) != NULL) {
+            return 4;
+        }
+    }
+
+    const char *games_2p[] = {
+        "Odyssey", "Super Mario Odyssey", "Snipperclips", "Cuphead", "It Takes Two",
+        "Unravel", "Portal 2", "Street Fighter", "Mortal Kombat", "Dragon Ball",
+        "Tekken", "Guilty Gear", "King of Fighters", "Skullgirls", "Arms",
+        "Pokemon", "Pokémon", "Pokken", "Pokkén", "Luigi's Mansion", "Pikmin", "Donkey Kong",
+        "Tropical Freeze", "Captain Toad", "Warriors", "Hyrule", "Fire Emblem",
+        "Children of Morta", "Haven", "A Way Out", "Gungeon",
+        "Guacamelee", "Terraria", "Untitled Goose", "Duel", "Versus", " VS ", " vs ",
+        "Bros", "Fighter", "Fighting", "Rumble", "Coop", "Co-op", "Team", "Two", "2 Player",
+        "2-Player", "2 Players", "AngerForce", "LIGHTNING FIGHTERS", "Brain Meltdown",
+        "Darius Cozmic", "Dodgeball Academia", "Double Dragon", "Fightro", "Forklift Extreme",
+        "Galactic Wars", "GensokyoDefenders", "I Am The Hero", "Johnny Turbo", "Lesson Learned",
+        "LET'S THROOOW", "Musashi vs Cthulhu", "Ninjin", "QUByte Classics", "Rad Rodgers",
+        "Rage of the Dragons", "Rawr-Off", "Redgar", "SEA POWER", "Spirit Arena",
+        "Super Dodgeball Beats", "Twin Robots", "Uragun", "Shovel Knight", "Metal Slug",
+        "Contra", "Mega Man", "Hotline Miami", "Binding of Isaac", "Salt and Sanctuary",
+        "Wizard of Legend", "Battle", "Boxing", "Wrestling", "Tennis", "Chess", "Checkers",
+        "A Hole New World", "Basketball Anime Girls", "Bubble Trouble", "Drunken Fist",
+        "Dunk Trickster", "Morsels", "Piczle Colors", "Pid", "PUTRID SHOT", "Rally Racer",
+        "Rocket Knight", "Sail Forth", "Shotgun King", "Beach Boys", "Tabletop", "Ping Pong",
+        "Air Hockey 3D", "3D Air Hockey", "Football", "Soccer", "Basketball"
+    };
+    for (size_t i = 0; i < sizeof(games_2p) / sizeof(games_2p[0]); ++i) {
+        if (case_str_search(name, games_2p[i]) != NULL) {
+            return 2;
+        }
+    }
+
+    return 1;
+}
+
+bool title_cache_refresh_installed_games(void) {
+    g_installed_game_count = 0;
+    size_t found = 0;
+    Result rc = nsInitialize();
+    if (R_FAILED(rc)) return false;
+    bool complete = true;
+    s32 offset = 0;
+    NsApplicationRecord records[32];
+    s32 out_count = 0;
+
+    NsApplicationControlData *ctrl_data = malloc(sizeof(NsApplicationControlData));
+
+    while (found < MAX_INSTALLED_GAMES) {
+        s32 fetch_count = (MAX_INSTALLED_GAMES - found > 32) ? 32 : (s32)(MAX_INSTALLED_GAMES - found);
+        Result list_rc = nsListApplicationRecord(records, fetch_count, offset, &out_count);
+        if (R_FAILED(list_rc)) {
+            complete = false;
+            break;
+        }
+        if (out_count <= 0) break;
+
+        for (s32 i = 0; i < out_count && found < MAX_INSTALLED_GAMES; ++i) {
+            u64 app_id = records[i].application_id;
+            if (app_id == 0) {
+                continue;
+            }
+
+            char name[128] = "";
+            if (ctrl_data) {
+                u64 actual_size = 0;
+                if (R_SUCCEEDED(nsGetApplicationControlData(NsApplicationControlSource_Storage, app_id, ctrl_data, sizeof(*ctrl_data), &actual_size))) {
+                    NacpLanguageEntry *lang_entry = NULL;
+                    if (R_SUCCEEDED(nacpGetLanguageEntry(&ctrl_data->nacp, &lang_entry)) && lang_entry && lang_entry->name[0] != '\0') {
+                        size_t lang_name_len = strnlen(lang_entry->name, sizeof(name) - 1);
+                        while (lang_name_len > 0 && ((unsigned char)lang_entry->name[lang_name_len] & 0xc0) == 0x80) {
+                            --lang_name_len;
+                        }
+                        memcpy(name, lang_entry->name, lang_name_len);
+                        name[lang_name_len] = '\0';
+                    }
+                }
+            }
+
+            if (name[0] == '\0') {
+                snprintf(name, sizeof(name), "0x%016llX", (unsigned long long) app_id);
+            }
+            trim_line(name);
+
+            // Avoid duplicates
+            bool dup = false;
+            for (size_t d = 0; d < found; ++d) {
+                if (g_installed_games[d].application_id == app_id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                g_installed_games[found].application_id = app_id;
+                size_t name_len = strlen(name);
+                if (name_len >= sizeof(g_installed_games[found].name)) {
+                    name_len = sizeof(g_installed_games[found].name) - 1;
+                }
+                memcpy(g_installed_games[found].name, name, name_len);
+                g_installed_games[found].name[name_len] = '\0';
+                g_installed_games[found].max_players = title_cache_get_max_players(app_id, name);
+                found++;
+            }
+        }
+        offset += out_count;
+    }
+
+    if (ctrl_data) {
+        free(ctrl_data);
+    }
+    nsExit();
+
+    if (complete) g_installed_game_count = found;
+    return complete;
+}
+
+static void append_json_escaped_string(char *dst, size_t dst_size, size_t *pos, const char *src) {
+    if (*pos + 1 >= dst_size) return;
+    dst[(*pos)++] = '"';
+    for (size_t i = 0; src[i] && *pos + 3 < dst_size; ++i) {
+        char ch = src[i];
+        if (ch == '"') {
+            dst[(*pos)++] = '\\';
+            dst[(*pos)++] = '"';
+        } else if (ch == '\\') {
+            dst[(*pos)++] = '\\';
+            dst[(*pos)++] = '\\';
+        } else if (ch == '\r' || ch == '\n' || ch == '\t') {
+            dst[(*pos)++] = ' ';
+        } else if ((unsigned char)ch >= 0x20) {
+            dst[(*pos)++] = ch;
+        }
+    }
+    if (*pos + 1 < dst_size) {
+        dst[(*pos)++] = '"';
+    }
+}
+
+
+size_t title_cache_build_games_attr(char *out, size_t out_size, int min_players) {
+    size_t pos = 0;
+    size_t count = 0;
+    size_t written = 0;
+    for (size_t i = 0; i < g_installed_game_count; ++i) {
+        if (g_installed_games[i].max_players >= min_players) ++count;
+    }
+
+    int prefix_len = snprintf(out, out_size, "{\"count\":%zu,\"min_players\":%d,\"games\":[",
+                              count, min_players);
+    if (prefix_len < 0 || (size_t)prefix_len + 3 > out_size) return count;
+    pos = (size_t)prefix_len;
+    for (size_t i = 0; i < g_installed_game_count; ++i) {
+        const InstalledGame *game = &g_installed_games[i];
+        if (game->max_players < min_players) continue;
+        if (out_size - pos < 2 * strlen(game->name) + 8) continue;
+        if (written++ > 0) out[pos++] = ',';
+        append_json_escaped_string(out, out_size, &pos, game->name);
+    }
+    memcpy(out + pos, "]}", 3);
+    return count;
 }

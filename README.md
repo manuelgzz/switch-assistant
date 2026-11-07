@@ -180,6 +180,24 @@ Main entities:
 | Commands | reboot, shutdown |
 | Notifications | Home Assistant popup on the Switch |
 
+### Additional sensors
+
+The sysmodule publishes the following entities in addition to the existing battery, game, controller, operation mode, and SD card sensors.
+
+| Entity | Reading |
+| --- | --- |
+| Docked | Binary state based on the same charger detection as Operation Mode. |
+| Player 1–8 Controller Wired | Wired connection for each detected player controller. |
+| SoC Temperature and Uptime | SoC temperature in °C when available and console uptime in seconds. |
+| Wi-Fi Signal Strength | 0–3 bars on Wi-Fi. Unset on Ethernet or when Wi-Fi status is unavailable. |
+| SD Card Total Space | microSD capacity in GiB. |
+| Internal Storage Free and Total Space | Capacity and free space of the NAND user partition in MiB. |
+| Switch Assistant RAM Used | Memory used by the sysmodule process in MiB. |
+| 2-, 4-, and 8+ Player Games | Counts of installed games by minimum player capacity, with a `games` attribute. |
+| Diagnostics | Service readiness and whether the installed-game inventory loaded. |
+
+Multiplayer counts use the [title rules from FaserF](https://github.com/FaserF/switch-assistant). To override a game's player capacity, set `TITLE_ID=4` or `Game Name=4` in `sdmc:/switch/switch-ha/players.ini` and reboot. The inventory is loaded once per boot in a separate thread.
+
 ## Live Streaming
 
 The console supports live streaming while you are in-game.

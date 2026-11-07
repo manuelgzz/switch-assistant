@@ -1,4 +1,5 @@
 #include "app_state.h"
+#include "title_cache.h"
 #include "config.h"
 #include "mqtt_client.h"
 #include "screen_stream.h"
@@ -15,6 +16,8 @@
 #define RESULT_OPTIONAL_TIMEOUT MAKERESULT(Module_Libnx, LibnxError_Timeout)
 #define RESULT_NOT_INITIALIZED MAKERESULT(Module_Libnx, LibnxError_NotInitialized)
 
+static Result g_ts_init_result = RESULT_NOT_INITIALIZED;
+static Result g_nifm_init_result = RESULT_NOT_INITIALIZED;
 static Result g_socket_init_result = RESULT_NOT_INITIALIZED;
 static Result g_psm_init_result = RESULT_NOT_INITIALIZED;
 static Result g_spsm_init_result = RESULT_NOT_INITIALIZED;
@@ -64,6 +67,8 @@ void __appExit(void) {
     screen_stream_stop();
     if (R_SUCCEEDED(g_spsm_init_result)) spsmExit();
     if (R_SUCCEEDED(g_psm_init_result)) psmExit();
+    if (R_SUCCEEDED(g_ts_init_result)) tsExit();
+    if (R_SUCCEEDED(g_nifm_init_result)) nifmExit();
     if (R_SUCCEEDED(g_socket_init_result)) socketExit();
     fsdevUnmountAll();
     fsExit();
@@ -217,6 +222,8 @@ typedef enum {
     OptionalService_Lbl,
     OptionalService_Audctl,
     OptionalService_Pminfo,
+    OptionalService_Ts,
+    OptionalService_Nifm,
 } OptionalService;
 
 typedef struct {
@@ -241,6 +248,19 @@ static void optional_init_thread(void *arg) {
                 break;
             case OptionalService_Pminfo:
                 rc = pminfoInitialize();
+                break;
+            case OptionalService_Ts:
+                if (hosversionGet() == 0 && R_SUCCEEDED(setsysInitialize())) {
+                    SetSysFirmwareVersion firmware;
+                    if (R_SUCCEEDED(setsysGetFirmwareVersion(&firmware))) {
+                        hosversionSet(MAKEHOSVERSION(firmware.major, firmware.minor, firmware.micro));
+                    }
+                    setsysExit();
+                }
+                rc = tsInitialize();
+                break;
+            case OptionalService_Nifm:
+                rc = nifmInitialize(NifmServiceType_System);
                 break;
         }
         smExit();
@@ -316,6 +336,11 @@ static void init_optional_services(AppState *state) {
     state->svc_pminfo_ready = R_SUCCEEDED(g_pminfo_init_result);
     append_log_result("pminfo_init", g_pminfo_init_result);
 
+    g_ts_init_result = init_service_with_timeout("ts", OptionalService_Ts);
+    state->svc_ts_ready = R_SUCCEEDED(g_ts_init_result);
+    g_nifm_init_result = init_service_with_timeout("nifm", OptionalService_Nifm);
+    state->svc_nifm_ready = R_SUCCEEDED(g_nifm_init_result);
+
     append_log("optional service init done");
 }
 
@@ -357,6 +382,20 @@ static void write_heartbeat(AppState *state) {
     fclose(file);
 }
 
+static Thread g_game_inventory_thread;
+
+static void load_game_inventory(void *arg) {
+    AppState *state = arg;
+    if (R_FAILED(smInitialize())) return;
+    bool ready = title_cache_refresh_installed_games();
+    smExit();
+
+    mutexLock(&state->lock);
+    state->game_inventory_ready = ready;
+    mutexUnlock(&state->lock);
+    append_log(ready ? "Game inventory loaded" : "Game inventory unavailable");
+}
+
 int main(int argc, char **argv) {
     AppState state;
     app_state_init(&state);
@@ -385,6 +424,13 @@ int main(int argc, char **argv) {
     init_power_guard(&state);
 
     mqtt_service_start(&state);
+    Result inventory_rc = threadCreate(&g_game_inventory_thread, load_game_inventory,
+                                       &state, NULL, 0x8000, 0x2C, -2);
+    if (R_SUCCEEDED(inventory_rc)) {
+        inventory_rc = threadStart(&g_game_inventory_thread);
+        if (R_FAILED(inventory_rc)) threadClose(&g_game_inventory_thread);
+    }
+    append_log_result("game_inventory_thread", inventory_rc);
     append_log("mqtt thread started");
 
     while (true) {
