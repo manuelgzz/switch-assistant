@@ -1,0 +1,46 @@
+name: Update published release notes
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/releases/*.md']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to update
+        required: true
+        default: v1.12.1
+
+permissions:
+  contents: write
+
+jobs:
+  update-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Update release body only
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            const pattern = /^docs\/releases\/(v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.md$/;
+            let tags;
+            if (context.eventName === 'workflow_dispatch') {
+              const tag = context.payload.inputs.tag;
+              if (!pattern.test(`docs/releases/${tag}.md`)) throw new Error('Invalid release tag');
+              tags = [tag];
+            } else {
+              const files = execFileSync('git', ['diff', '--name-only', '--diff-filter=AM', context.payload.before, context.sha, '--', 'docs/releases'], { encoding: 'utf8' });
+              tags = [...new Set(files.split('\n').map(file => file.match(pattern)).filter(Boolean).map(match => match[1]))];
+            }
+            for (const tag of tags) {
+              const body = fs.readFileSync(`docs/releases/${tag}.md`, 'utf8');
+              if (!body.trim()) throw new Error(`Empty notes for ${tag}`);
+              const { data: release } = await github.rest.repos.getReleaseByTag({ ...context.repo, tag });
+              await github.rest.repos.updateRelease({ ...context.repo, release_id: release.id, body });
+              core.info(`Updated notes for ${tag}: ${release.html_url}`);
+            }
