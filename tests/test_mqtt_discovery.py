@@ -54,6 +54,7 @@ int main(void) {
  publish_discovery_sensor(1,&a,"sensor","current_game","Current game",NULL,NULL,NULL);
  publish_discovery_sensor(1,&a,"sensor","current_game_id","Title ID",NULL,NULL,NULL);
  publish_discovery_sensor(1,&a,"binary_sensor","game_running","Game running","running",NULL,NULL);
+ publish_discovery_sensor(1,&a,"sensor","operation_mode","Operation Mode",NULL,NULL,NULL);
 }
 '''
         with tempfile.TemporaryDirectory() as temp:
@@ -86,7 +87,9 @@ int main(void) {
         self.assertNotEqual(a["uniq_id"], b["uniq_id"])
         self.assertEqual(a["cmd_t"], "switch_ha/switch_a/control/set_brightness")
         self.assertEqual(a["avty_mode"], "all")
-        self.assertEqual(a["avty"][1]["t"], "switch_ha/switch_a/capability/lbl")
+        self.assertEqual(a["avty"][0]["topic"], "switch_ha/switch_a/status")
+        self.assertEqual(a["avty"][0]["value_template"], "{{ value_json.status }}")
+        self.assertEqual(a["avty"][1]["topic"], "switch_ha/switch_a/capability/lbl")
         self.assertEqual(a["dev"]["name"], 'Switch "living\\room"')
         self.assertEqual(packets[2][1]["unit_of_meas"], "MiB")
         self.assertEqual(packets[3][1]["event_types"], ["quick_action_1"])
@@ -115,6 +118,8 @@ int main(void) {
                 self.assertNotIn("avty", entity)
                 self.assertNotIn("expire_after", entity)
         self.assertGreater(telemetry_count, 30)
+        self.assertEqual(packets[-1][1]["stat_t"], "switch_ha/switch_a/status")
+        self.assertEqual(packets[-1][1]["value_template"], "{{ value_json.operation_mode | default('unknown') }}")
         print(f"Validated {len(packets)} discovery payloads")
 
 

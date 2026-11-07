@@ -19,12 +19,18 @@ Ese topic compartido ya no se suscribe, para evitar controlar varias consolas a 
 Los comandos y acciones no deben publicarse con `retain: true`: se rechazan.
 Los estados y discovery sí se retienen.
 
-Los controles usan `switch_ha/<id>/availability` con `online`/`offline` y
-último testamento MQTT; los que requieren servicios opcionales también comprueban
-su disponibilidad. Los sensores y sensores binarios no dependen de esa disponibilidad:
-conservan su último estado retenido durante la suspensión o una desconexión.
-Es una última lectura conocida, no una medición nueva mientras la consola duerme.
-Una pérdida de red por sí sola no cambia `Operation Mode` a `Sleep`.
+Los controles usan `switch_ha/<id>/status`, un JSON retenido con `status=online`
+o `offline`; los que requieren servicios opcionales también comprueban su disponibilidad.
+Los sensores y sensores binarios no dependen de esa disponibilidad: conservan su
+último estado retenido durante la suspensión o una desconexión. Es una última
+lectura conocida, no una medición nueva mientras la consola duerme.
+
+Desde fix6, `Operation Mode` lee `operation_mode` del mismo JSON. El último testamento
+MQTT publica `Sleep` con `mode_source=mqtt_disconnect` al perderse la conexión.
+Es una inferencia: una caída de red también puede mostrar Sleep. Con keepalive de
+30 segundos, el broker normalmente detecta el silencio en unos 45 segundos desde
+el último paquete. `Power state source` permite distinguir `live` de esa inferencia.
+No se registra ningún participante en la suspensión de Horizon.
 
 ## Controles
 
@@ -231,7 +237,10 @@ para nombres de juegos y el índice del catálogo se conservan. El apartado de
 fix3 documenta el comportamiento anterior, sustituido por esta corrección.
 
 
-## Suspensión y últimas lecturas: 1.12.1-fix5
+## Suspensión y últimas lecturas: 1.12.1-fix5 (retirado)
+
+**El listener PSC de esta versión fue retirado en fix6 tras el fallo reportado al
+suspender. Esta sección documenta el cambio anterior; no debe reintroducirse.**
 
 El detector anterior infería la suspensión a partir de la retroiluminación y no
 podía distinguir correctamente una pantalla apagada de la suspensión real.
@@ -263,3 +272,30 @@ el límite de espera y desregistro en caso de error. Un peer MQTT local verifica
 los paquetes retenidos, el PUBACK exacto, DISCONNECT y que una desconexión ordinaria
 no sobrescriba el modo ni los valores de batería/juego/audio. La recepción de eventos
 reales y el ciclo de suspensión/reanudación necesitan validación en consola.
+
+
+## Recuperación de suspensión: 1.12.1-fix6
+
+La pantalla reportada muestra `0100000000000034`, el servicio fatal de Atmosphere,
+y `std::abort() called`. La foto y el intervalo aproximado de 66 segundos no bastan
+para identificar el primer error; el reporte `.bin` permitiría investigarlo.
+El listener PSC añadido en fix5 tenía otras consultas IPC en el mismo hilo. Una
+consulta de pantalla bloqueada antes de leer el evento puede impedir confirmar
+la suspensión, aunque la espera MQTT posterior tenga un límite de 500 ms.
+
+Para aislar esta regresión se retira completamente la participación en `psc:m`,
+las dependencias de energía y sus confirmaciones. El hilo de retroiluminación
+vuelve a ser un observador pasivo, sin obligaciones ante el gestor de energía.
+Se conservan los sensores retenidos y las correcciones anteriores. El antiguo
+sensor `Power event listener` se elimina mediante un payload de discovery vacío.
+
+El modo Sleep pasa a ser una inferencia pasiva del estado MQTT, como se describe
+arriba. Se confirma mediante pruebas el JSON del último testamento, su retención,
+el keepalive y la publicación de estado vivo al reconectar; el programa ya no
+incluye llamadas de registro/confirmación PSC. No se afirma haber reproducido ni
+resuelto físicamente el fallo de la consola con pruebas de host.
+
+Instalar el NRO abriendo Switch Assistant y reiniciar completamente, para retirar
+el registro PSC del proceso anterior. Validar suspensión por al menos tres minutos
+y reanudación. Si el fallo persiste, adjuntar el `.bin` correspondiente de
+`sdmc:/atmosphere/fatal_errors/` para identificar la llamada que aborta.

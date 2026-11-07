@@ -18,7 +18,6 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <sys/statvfs.h>
-#include <sys/time.h>
 
 #define MQTT_BUFFER 2048
 #define MQTT_KEEPALIVE 30
@@ -61,6 +60,7 @@ typedef struct {
 } MqttContext;
 
 static MqttContext g_ctx = {0};
+static char g_operation_mode[16] = "unknown";
 
 static void sanitize_id(const char *input, char *output, size_t output_size);
 static const char *client_id_or_device(const AppConfig *config);
@@ -319,9 +319,9 @@ static bool mqtt_send_connect(const AppConfig* config, int fd) {
     ptr = write_string(ptr, config->mqtt_client_id[0] ? config->mqtt_client_id : config->device_name);
 
     char will_topic[192];
-    state_topic(config, "availability", will_topic, sizeof(will_topic));
+    state_topic(config, "status", will_topic, sizeof(will_topic));
     ptr = write_string(ptr, will_topic);
-    ptr = write_string(ptr, "offline");
+    ptr = write_string(ptr, "{\"status\":\"offline\",\"operation_mode\":\"Sleep\",\"mode_source\":\"mqtt_disconnect\"}");
 
     if (config->mqtt_username[0] != '\0') {
         ptr = write_string(ptr, config->mqtt_username);
@@ -796,7 +796,7 @@ static void publish_discovery_sensor(int fd, const AppConfig *config, const char
 
     sanitize_id(client_id_or_device(config), safe_id, sizeof(safe_id));
     discovery_topic(config, component, sensor, topic, sizeof(topic));
-    state_topic(config, sensor, state, sizeof(state));
+    state_topic(config, strcmp(sensor,"operation_mode")==0?"status":sensor, state, sizeof(state));
 
     snprintf(payload, sizeof(payload),
              "{\"name\":\"%s\",\"uniq_id\":\"%s_%s\",\"stat_t\":\"%s\",\"dev\":{\"ids\":[\"%s\"],\"name\":\"%s\",\"mf\":\"Nintendo\",\"mdl\":\"Switch\"}%s%s%s%s}",
@@ -826,6 +826,10 @@ static void publish_discovery_sensor(int fd, const AppConfig *config, const char
         }
     }
 
+    if(strcmp(sensor,"operation_mode")==0) {
+        size_t used=strlen(payload);
+        snprintf(payload+used-1,sizeof(payload)-used+1,",\"value_template\":\"{{ value_json.operation_mode | default('unknown') }}\"}");
+    }
     /* Telemetry keeps its last retained reading even while MQTT is offline. */
     mqtt_send_publish(fd, topic, payload, true);
 }
@@ -887,6 +891,7 @@ static void clear_discovery_topic(int fd, const AppConfig *config, const char *c
     mqtt_send_publish(fd, topic, "", true);
 }
 
+static void publish_state(AppState *, int, const AppConfig *, const char *);
 static void extended_discovery(AppState *, int, const AppConfig *);
 static void extended_poll(AppState *, int, const AppConfig *);
 static bool extended_command(AppState *, int, const AppConfig *, const char *, const char *);
@@ -973,10 +978,6 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     u32 percent = 0;
     PsmChargerType charger = PsmChargerType_Unconnected;
     PsmBatteryChargeInfoFields info = {0};
-    mutexLock(&state->lock);
-    bool power_sleeping = state->power_sleeping;
-    mutexUnlock(&state->lock);
-    if (power_sleeping) return;
 
     if (R_SUCCEEDED(psmGetBatteryChargePercentage(&percent))) {
         snprintf(value, sizeof(value), "%u", percent);
@@ -1010,9 +1011,7 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
         publish_if_changed(fd, config, snapshot, force, "battery_health", snapshot->battery_health, sizeof(snapshot->battery_health), "None");
     }
 
-    if (power_sleeping) {
-        publish_if_changed(fd, config, snapshot, force, "backlight", snapshot->backlight, sizeof(snapshot->backlight), "OFF");
-    } else if (state->svc_lbl_ready) {
+    if (state->svc_lbl_ready) {
         float brightness = 0.0f;
         if (R_SUCCEEDED(lblGetCurrentBrightnessSetting(&brightness)) || R_SUCCEEDED(lblGetBrightnessSettingAppliedToBacklight(&brightness))) {
             snprintf(value, sizeof(value), "%.0f", (double) (brightness * 100.0f));
@@ -1101,12 +1100,11 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
     }
 
     char current_mode[16];
-    if (power_sleeping) {
-        snprintf(current_mode, sizeof(current_mode), "Sleep");
-    }
-    else {
-        bool docked=false;
-        snprintf(current_mode,sizeof(current_mode),"%s",ext_docked(&docked)?(docked?"Docked":"Handheld"):"unknown");
+    bool docked=false;
+    snprintf(current_mode,sizeof(current_mode),"%s",ext_docked(&docked)?(docked?"Docked":"Handheld"):"unknown");
+    if(force || strcmp(g_operation_mode,current_mode)!=0) {
+        snprintf(g_operation_mode,sizeof(g_operation_mode),"%s",current_mode);
+        publish_state(state,fd,config,"online");
     }
 
     publish_if_changed(fd, config, snapshot, force, "operation_mode",
@@ -1136,55 +1134,21 @@ static void publish_switch_sensors(AppState *state, int fd, const AppConfig *con
 
 static void publish_state(AppState *state, int fd, const AppConfig *config, const char *status) {
     char topic[192];
-    char payload[900],device_name[400],client_id[400];
+    char payload[1200],device_name[400],client_id[400];
     ext_escape(config->device_name,device_name,sizeof(device_name));
     ext_escape(client_id_or_device(config),client_id,sizeof(client_id));
     state_topic(config,"status",topic,sizeof(topic));
     snprintf(payload, sizeof(payload),
-             "{\"device\":\"%s\",\"client_id\":\"%s\",\"status\":\"%s\",\"ha_validated\":%s}",
+             "{\"device\":\"%s\",\"client_id\":\"%s\",\"status\":\"%s\",\"ha_validated\":%s,\"operation_mode\":\"%s\",\"mode_source\":\"%s\"}",
              device_name,
              client_id,
              status,
-             state->ha_validated ? "true" : "false");
+             state->ha_validated ? "true" : "false",
+             strcmp(status,"online")==0?g_operation_mode:"Sleep",
+             strcmp(status,"online")==0?"live":"mqtt_disconnect");
     mqtt_send_publish(fd, topic, payload, true);
     state_topic(config, "availability", topic, sizeof(topic));
     mqtt_send_publish(fd, topic, strcmp(status,"online")==0?"online":"offline", true);
-}
-
-static bool mqtt_publish_sleep(AppState *state, int fd, const AppConfig *config) {
-    /* This function deliberately publishes no battery/game/audio readings. */
-    struct timeval timeout = {.tv_sec=0, .tv_usec=100000};
-    setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
-    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-    publish_state(state, fd, config, "sleep");
-    char topic[192];
-    state_topic(config,"operation_mode",topic,sizeof(topic));
-    unsigned char body[256],packet[272];
-    unsigned char *end=write_string(body,topic);
-    *end++=0x53; *end++=0x48; /* Dedicated packet identifier: "SH". */
-    memcpy(end,"Sleep",5); end+=5;
-    packet[0]=0x33; /* Retained PUBLISH, QoS 1. */
-    int length_bytes=encode_remaining_length(packet+1,(int)(end-body));
-    memcpy(packet+1+length_bytes,body,(size_t)(end-body));
-    bool flushed = false;
-    if (mqtt_send_packet(fd,packet,1+length_bytes+(size_t)(end-body))) {
-        u64 deadline = monotonic_ms() + 200;
-        while (monotonic_ms() < deadline) {
-            struct pollfd pfd = {.fd=fd,.events=POLLIN};
-            if (poll(&pfd,1,25) <= 0) continue;
-            unsigned char packet[MQTT_BUFFER];
-            int size = mqtt_read_frame(fd,packet,sizeof(packet),socket_recv_all);
-            if (size <= 0) break;
-            /* Only this PUBACK confirms storage of our retained Sleep state. */
-            if (size==4 && packet[0]==0x40 && packet[1]==2 && packet[2]==0x53 && packet[3]==0x48) {flushed=true;break;}
-        }
-    }
-    const unsigned char disconnect[] = {0xe0,0x00};
-    mqtt_send_packet(fd,disconnect,sizeof(disconnect));
-    mutexLock(&state->lock);
-    state->mqtt_sleep_publish_finished = true;
-    mutexUnlock(&state->lock);
-    return flushed;
 }
 
 static bool read_mqtt_remaining_length(const unsigned char *buffer, int size, int *value, int *bytes_used) {
@@ -1355,8 +1319,6 @@ static void mqtt_loop(void *arg) {
     while (true) {
         mutexLock(&state->lock);
         bool should_exit = state->exit_requested;
-        bool power_sleeping = state->power_sleeping;
-        bool dns_ok = state->mqtt_dns_ok;
         AppConfig config = state->config;
         mutexUnlock(&state->lock);
 
@@ -1366,12 +1328,6 @@ static void mqtt_loop(void *arg) {
 
         if (should_exit) {
             break;
-        }
-
-        if (power_sleeping) {
-            mqtt_set_status(state, dns_ok, false, false, "sleeping");
-            svcSleepThread(1000 * 1000 * 1000ULL);
-            continue;
         }
 
         if (host[0] == '\0' || config.mqtt_topic_prefix[0] == '\0') {
@@ -1476,7 +1432,6 @@ static void mqtt_loop(void *arg) {
 
             mutexLock(&state->lock);
             should_exit = state->exit_requested;
-            power_sleeping = state->power_sleeping;
             bool sensor_publish_requested = state->sensor_publish_requested;
             if (sensor_publish_requested) {
                 state->sensor_publish_requested = false;
@@ -1485,8 +1440,6 @@ static void mqtt_loop(void *arg) {
             if (should_exit) {
                 break;
             }
-
-            if (power_sleeping) break;
 
             u64 now = monotonic_ms();
             if (sensor_publish_requested || now - last_sensor_poll_ms >= SENSOR_POLL_INTERVAL_MS) {
@@ -1503,25 +1456,15 @@ static void mqtt_loop(void *arg) {
             }
         }
 
-        mutexLock(&state->lock);
-        power_sleeping = state->power_sleeping;
-        mutexUnlock(&state->lock);
-        if (power_sleeping) {
-            bool flushed = mqtt_publish_sleep(state,fd,&config);
-            app_state_push_log(state,"Sleep state %s",flushed?"acknowledged by broker":"flush not confirmed");
-        } else {
-            publish_state(state, fd, &config, "offline");
-        }
+        publish_state(state, fd, &config, "offline");
         close(fd);
         g_ctx.socket_fd = -1;
         mutexLock(&state->lock);
         state->mqtt_tcp_ok = false;
         state->mqtt_connected = false;
-        snprintf(state->mqtt_last_error, sizeof(state->mqtt_last_error), "%s", power_sleeping ? "sleeping" : "disconnected");
+        snprintf(state->mqtt_last_error, sizeof(state->mqtt_last_error), "disconnected");
         mutexUnlock(&state->lock);
-        if (!power_sleeping) {
-            app_state_push_log(state, "MQTT disconnected");
-        }
+        app_state_push_log(state, "MQTT disconnected");
     }
     if(ext_ts) {tsExit();ext_ts=false;}
     if(ext_nifm) {nifmExit();ext_nifm=false;}

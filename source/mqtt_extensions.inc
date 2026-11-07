@@ -34,20 +34,20 @@ static const char *ext_capability(const char *id) {
 }
 static void ext_availability(const AppConfig*c,const char*id,char*json,size_t size) {
     char device[192],service[192],suffix[40];
-    state_topic(c,"availability",device,sizeof(device));
+    state_topic(c,"status",device,sizeof(device));
     size_t used=strlen(json);if(!used)return;
     const char*cap=ext_capability(id);
     if(cap){
         snprintf(suffix,sizeof(suffix),"capability/%s",cap);state_topic(c,suffix,service,sizeof(service));
-        snprintf(json+used-1,size-used+1,",\"avty_mode\":\"all\",\"avty\":[{\"t\":\"%s\"},{\"t\":\"%s\"}]}",device,service);
-    }else snprintf(json+used-1,size-used+1,",\"avty_t\":\"%s\"}",device);
+        snprintf(json+used-1,size-used+1,",\"avty_mode\":\"all\",\"avty\":[{\"topic\":\"%s\",\"value_template\":\"{{ value_json.status }}\"},{\"topic\":\"%s\"}]}",device,service);
+    }else snprintf(json+used-1,size-used+1,",\"avty_t\":\"%s\",\"availability_template\":\"{{ value_json.status }}\"}",device);
 }
 
 static void ext_entity(int fd, const AppConfig *c, const char *type, const char *id,
                        const char *name, const char *extra, bool control) {
     char topic[256], stat[192], cmd[192], safe[80], escaped[400], payload[MQTT_BUFFER];
     discovery_topic(c, type, id, topic, sizeof(topic));
-    state_topic(c, id, stat, sizeof(stat));
+    state_topic(c, strcmp(id,"power_state_source")==0?"status":id, stat, sizeof(stat));
     char suffix[100]; snprintf(suffix, sizeof(suffix), "control/%s", id);
     state_topic(c, suffix, cmd, sizeof(cmd));
     sanitize_id(client_id_or_device(c), safe, sizeof(safe));
@@ -82,7 +82,8 @@ static void extended_discovery(AppState *state, int fd, const AppConfig *c) {
     ext_entity(fd,c,"event","overlay_action","Overlay action",",\"event_types\":[\"quick_action_1\",\"quick_action_2\",\"quick_action_3\",\"quick_action_4\"]",false);
     const char *sensors[][3]={{"uptime","Console uptime",",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\""},{"mqtt_reconnections","MQTT reconnections",""},{"mqtt_session","MQTT session duration",",\"unit_of_meas\":\"s\""},{"soc_temperature","Internal temperature",",\"unit_of_meas\":\"°C\",\"dev_cla\":\"temperature\""},{"wifi_bars","Wi-Fi signal bars",",\"icon\":\"mdi:wifi\""},{"connection_type","Connection type",""},{"process_memory","Sysmodule memory",",\"unit_of_meas\":\"MiB\""},{"sd_total","SD capacity",",\"unit_of_meas\":\"GiB\""},{"internal_free","Internal free space",",\"unit_of_meas\":\"GiB\""},{"internal_total","Internal capacity",",\"unit_of_meas\":\"GiB\""},{"game_session","Game session duration",",\"unit_of_meas\":\"s\""},{"stream_status","RTSP status",""},{"command_status","Last command result",""}};
     for(size_t i=0;i<sizeof(sensors)/sizeof(sensors[0]);i++) ext_entity(fd,c,"sensor",sensors[i][0],sensors[i][1],sensors[i][2],false);
-    ext_entity(fd,c,"sensor","power_events","Power event listener",",\"ent_cat\":\"diagnostic\"",false);
+    clear_discovery_topic(fd,c,"sensor","power_events");
+    ext_entity(fd,c,"sensor","power_state_source","Power state source",",\"ent_cat\":\"diagnostic\",\"value_template\":\"{{ value_json.mode_source | default('unknown') }}\"",false);
     ext_entity(fd,c,"sensor","game_query_status","Game detection diagnostic",",\"ent_cat\":\"diagnostic\"",false);
     ext_entity(fd,c,"binary_sensor","docked","Docked","",false);
     char diagnostic_topic[192],diagnostic_extra[320];
@@ -118,7 +119,6 @@ static void extended_poll(AppState *s,int fd,const AppConfig*c) {
             if(mqtt_send_publish(fd,topic,json,false))remove("sdmc:/switch/switch-ha/overlay-command.ini");
         } else remove("sdmc:/switch/switch-ha/overlay-command.ini");
     }
-    publish_value(fd,c,"power_events",s->svc_psc_ready?"ready":"unavailable");
     const char *caps[]={"lbl","audctl","hid","pminfo","ts","nifm","launch"};
     bool ready[]={s->svc_lbl_ready,s->svc_audctl_ready,s->svc_hid_ready,s->svc_pminfo_ready,ext_ts,ext_nifm,s->app_mode==AppMode_ForegroundApp && (appletGetAppletType()==AppletType_Application || appletGetAppletType()==AppletType_LibraryApplet)};
     for(size_t i=0;i<7;i++){char topic[40];snprintf(topic,sizeof(topic),"capability/%s",caps[i]);publish_value(fd,c,topic,ready[i]?"online":"offline");}

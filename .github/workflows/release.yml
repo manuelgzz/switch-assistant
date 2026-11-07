@@ -34,8 +34,6 @@ jobs:
           /tmp/game-query-test
           gcc -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/stubs -Iinclude tests/runtime_version_test.c -o /tmp/runtime-version-test
           /tmp/runtime-version-test
-          gcc -Wall -Wextra -Werror -fsanitize=address,undefined -Itests/stubs -Iinclude tests/power_policy_test.c -o /tmp/power-policy-test
-          /tmp/power-policy-test
 
       - name: Build NRO
         run: |

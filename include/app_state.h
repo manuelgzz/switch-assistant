@@ -48,9 +48,6 @@ typedef struct {
     bool svc_audctl_ready;
     bool svc_spsm_ready;
     bool svc_pminfo_ready;
-    bool power_sleeping;
-    bool svc_psc_ready;
-    bool mqtt_sleep_publish_finished;
     bool sensor_publish_requested;
     u64 last_heartbeat_ms;
     char status_line[SHA_LOG_LINE];

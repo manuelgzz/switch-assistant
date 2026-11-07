@@ -40,9 +40,3 @@ void setsysExit(void);
 Result setsysGetFirmwareVersion(SetSysFirmwareVersion*);
 
 #define LibnxError_NotInitialized 3
-
-typedef enum {
-    PscPmState_Awake=0, PscPmState_ReadyAwaken=1,
-    PscPmState_ReadySleep=2, PscPmState_ReadySleepCritical=3,
-    PscPmState_ReadyAwakenCritical=4, PscPmState_ReadyShutdown=5
-} PscPmState;
